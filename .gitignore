@@ -6,3 +6,6 @@ dist/
 .vs/
 .idea/
 *.zip
+
+# Upstream sources kept locally for reference only - source-available, not ours to redistribute
+reference/
