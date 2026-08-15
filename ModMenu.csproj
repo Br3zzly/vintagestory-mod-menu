@@ -1,0 +1,150 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>ModMenu</AssemblyName>
+    <RootNamespace>ModMenu</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <!--
+    Vintage Story install location. The launcher normally sets VINTAGE_STORY; if it
+    is not set we fall back to the default Windows install path.
+  -->
+  <PropertyGroup>
+    <VintagestoryDir Condition="'$(VINTAGE_STORY)' != ''">$(VINTAGE_STORY)</VintagestoryDir>
+    <VintagestoryDir Condition="'$(VintagestoryDir)' == ''">$(AppData)\Vintagestory</VintagestoryDir>
+  </PropertyGroup>
+
+  <Target Name="CheckGameDir" BeforeTargets="BeforeBuild">
+    <Error Condition="!Exists('$(VintagestoryDir)\VintagestoryAPI.dll')"
+           Text="Could not find VintagestoryAPI.dll in '$(VintagestoryDir)'. Set the VINTAGE_STORY environment variable to your Vintage Story install folder." />
+  </Target>
+
+  <ItemGroup>
+    <Reference Include="VintagestoryAPI">
+      <HintPath>$(VintagestoryDir)\VintagestoryAPI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="VintagestoryLib">
+      <HintPath>$(VintagestoryDir)\VintagestoryLib.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(VintagestoryDir)\Lib\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>$(VintagestoryDir)\Lib\Newtonsoft.Json.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="cairo-sharp">
+      <HintPath>$(VintagestoryDir)\Lib\cairo-sharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="protobuf-net">
+      <HintPath>$(VintagestoryDir)\Lib\protobuf-net.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- World map, waypoints and their dialogs live here. -->
+    <Reference Include="VSEssentials">
+      <HintPath>$(VintagestoryDir)\Mods\VSEssentials.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="modinfo.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!--
+    Bundle the mod into a single zip that can be dropped straight into the Mods folder.
+    Vintage Story expects modinfo.json at the archive root next to the dll.
+  -->
+  <PropertyGroup>
+    <PackageStaging>$(MSBuildProjectDirectory)\obj\package</PackageStaging>
+    <PackageZip>$(MSBuildProjectDirectory)\dist\$(AssemblyName).zip</PackageZip>
+  </PropertyGroup>
+
+  <Target Name="PackageMod" AfterTargets="Build">
+    <RemoveDir Directories="$(PackageStaging)" />
+    <MakeDir Directories="$(PackageStaging);$(MSBuildProjectDirectory)\dist" />
+
+    <Copy SourceFiles="$(TargetPath);$(MSBuildProjectDirectory)\modinfo.json"
+          DestinationFolder="$(PackageStaging)" />
+
+    <Delete Files="$(PackageZip)" />
+    <ZipDirectory SourceDirectory="$(PackageStaging)" DestinationFile="$(PackageZip)" />
+
+    <Message Importance="high" Text="Packaged mod -> $(PackageZip)" />
+  </Target>
+
+  <!--
+    One-command install:  dotnet build -c Release -t:Deploy
+
+    The only thing that actually breaks a mod update is replacing the zip while the game is
+    running: .NET cannot load a second assembly with the same name into a live process, so
+    the next world load fails with "Assembly with same name is already loaded" and the mod
+    is skipped. Hence the running-process guard below - it is the entire problem.
+
+    The Cache\unpack\ModMenu.zip_<hash> folders are NOT part of that problem. Each is keyed
+    by the hash of its own zip and ModContainer only enumerates the one matching the zip in
+    Mods, so orphans are never loaded. They are swept up here purely to stop them piling up
+    over many dev rebuilds.
+
+    Opt-in on purpose: a plain `dotnet build` never touches the game install.
+  -->
+  <PropertyGroup>
+    <VintagestoryDataDir Condition="'$(VINTAGE_STORY_DATA)' != ''">$(VINTAGE_STORY_DATA)</VintagestoryDataDir>
+    <VintagestoryDataDir Condition="'$(VintagestoryDataDir)' == ''">$(AppData)\VintagestoryData</VintagestoryDataDir>
+  </PropertyGroup>
+
+  <Target Name="Deploy" DependsOnTargets="Build">
+    <Error Condition="!Exists('$(VintagestoryDataDir)\Mods')"
+           Text="No Mods folder at '$(VintagestoryDataDir)\Mods'. Set VINTAGE_STORY_DATA to your Vintage Story data folder." />
+
+    <!--
+      Deploying into a live game leaves it running the previous dll and makes the next world
+      load fail confusingly, so stop before that happens rather than after.
+
+      Matching is done on the captured output rather than piping through `find`: MSBuild
+      runs Exec via a generated .cmd file, and the pipe plus nested quotes do not survive
+      that intact, which silently makes the check always report "not running".
+    -->
+    <Exec Command="tasklist /FI &quot;IMAGENAME eq Vintagestory.exe&quot;"
+          ConsoleToMSBuild="true" IgnoreExitCode="true" ContinueOnError="true"
+          StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="TaskListOutput" />
+    </Exec>
+
+    <Error Condition="'$(TaskListOutput)' != '' And $(TaskListOutput.Contains('Vintagestory.exe'))"
+           Text="Vintage Story is running. Close it first - swapping the mod now would leave the game on the old dll and make the next world load fail with 'Assembly with same name is already loaded'." />
+
+    <!--
+      Vintage Story leaves the unpacked dll read-only, which RemoveDir cannot get past on
+      its own, so drop the attribute across the whole tree first.
+    -->
+    <Exec Command="attrib -R &quot;$(VintagestoryDataDir)\Cache\unpack\$(AssemblyName).zip_*&quot; /S /D"
+          ContinueOnError="true" StandardOutputImportance="low" StandardErrorImportance="low" />
+
+    <!-- Collect the unpack folders by globbing their contents, then strip back to the dir. -->
+    <ItemGroup>
+      <StaleUnpackFile Include="$(VintagestoryDataDir)\Cache\unpack\$(AssemblyName).zip_*\**\*" />
+    </ItemGroup>
+
+    <Delete Files="@(StaleUnpackFile)" ContinueOnError="true" />
+    <RemoveDir Directories="@(StaleUnpackFile->'%(RootDir)%(Directory)')"
+               ContinueOnError="true" />
+
+    <Copy SourceFiles="$(PackageZip)" DestinationFolder="$(VintagestoryDataDir)\Mods" />
+
+    <Message Importance="high" Text="Deployed $(AssemblyName).zip and cleared stale unpack caches." />
+    <Message Importance="high" Text="If Vintage Story is running, restart it." />
+  </Target>
+
+</Project>

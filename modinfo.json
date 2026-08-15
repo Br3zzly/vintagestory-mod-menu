@@ -1,0 +1,14 @@
+{
+  "type": "code",
+  "modid": "modmenu",
+  "name": "Mod Menu",
+  "description": "Client-side utility menu (F2): invincibility, flight, teleport with saveable locations, instant mine and no tool durability loss.",
+  "authors": [ "Br3zzly" ],
+  "version": "1.0.0",
+  "side": "Universal",
+  "requiredOnClient": true,
+  "requiredOnServer": false,
+  "dependencies": {
+    "game": "1.22.0"
+  }
+}
