@@ -2,6 +2,8 @@
 
 A client-side utility menu for Vintage Story 1.22. Press **F2** in game to open it.
 
+<img src="docs/screenshot1.png" alt="The Mod Menu window" width="380">
+
 ## Features
 
 - **Invincibility** — blocks all incoming damage
