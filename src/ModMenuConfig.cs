@@ -42,6 +42,15 @@ namespace ModMenu
         /// </summary>
         public float GammaBeforeFullbright;
 
+        /// <summary>Every hit you land kills outright. Server-decided, like invincibility.</summary>
+        public bool OneHitKill;
+
+        /// <summary>Saturation stops draining. Server-decided.</summary>
+        public bool NoHunger;
+
+        /// <summary>Lifts the server's 23-items-a-second collection rate. Server-decided.</summary>
+        public bool FastPickup;
+
         /// <summary>Breaks the rest of a vein when one block of it is mined.</summary>
         public bool VeinMiner;
 
@@ -90,7 +99,7 @@ namespace ModMenu
 
         /// <summary>Blocks added to the player's own picking range. Zero leaves it alone.</summary>
         public const int MinReachBonus = 0;
-        public const int MaxReachBonus = 30;
+        public const int MaxReachBonus = 100;
 
         public int ReachBonus;
 

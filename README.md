@@ -2,7 +2,11 @@
 
 A client-side utility menu for Vintage Story 1.22. Press **F2** in game to open it.
 
-<img src="docs/screenshot1.png" alt="The Mod Menu window" width="380">
+<img src="docs/screenshot1.png" alt="The Mod Menu window" width="560">
+
+Four tabs - Player, Movement, Mining, Teleport - because as one column it outgrew the screen at
+larger GUI scales. A tab that still does not fit splits into a second column rather than running
+off the bottom. Greyed switches are the ones this server cannot honour; hovering says why.
 
 ## Features
 
@@ -13,13 +17,17 @@ A client-side utility menu for Vintage Story 1.22. Press **F2** in game to open 
 - **Teleport to coordinates** — type X/Y/Z and go
 - **Three saveable locations** — stand somewhere, press *Save*, rename the slot to whatever you like, press *Go* to return
 - **Fullbright** — unlit caves become readable, no torches involved
-- **Reach** — up to 30 blocks of extra reach for opening, breaking and placing. Attacking is
-  capped by the server at twice your weapon's range whatever this says; see below
+- **Reach** — up to 100 blocks of extra reach for opening, breaking and placing. Attacking that
+  far needs the mod on the server too, and then follows the slider without a switch of its own
 - **Instant mine** — blocks break in a single tick
 - **Vein miner** — breaking one block of a vein takes the rest of it, up to a limit you set
   between 1 and 400 blocks, with white outlines showing what the next swing would take, and a
   *AntiAbuse Safe* switch deciding whether it trickles or goes all at once
 - **Drops at player** — what you mine lands at your feet instead of in the hole
+- **Faster pickup** — lifts the server's 23-items-a-second collection rate, which is the real
+  bottleneck after a large vein mine
+- **One hit kill** — anything you hit dies
+- **No hunger** — saturation stops draining
 - **No durability loss** — tools, weapons and armour never wear down
 - **Teleport from the world map** — right-click anywhere on the map for a small menu with the
   usual waypoint option plus *Teleport here*
@@ -37,13 +45,27 @@ side of that line. This matters if you play on servers you do not control.
 | Teleport (coords and slots) | yes | yes | yes |
 | Fullbright | yes | yes | yes |
 | Reach, on blocks | yes | yes | **only with anti abuse off** |
-| Reach, attacking entities | yes | yes | **capped at 2x attack range** |
 | Instant mine | yes | yes | yes |
 | Vein miner | yes | yes | yes |
 | Invincibility (full) | yes | yes | **client-visual only** |
 | No fall damage | yes | yes | **yes** |
 | No durability loss | yes | yes | **client-visual only** |
 | Drops at player | yes | yes | **no** |
+| One hit kill | yes | yes | **no** |
+| No hunger | yes | yes | **no** |
+| Faster pickup | yes | yes | **no** |
+| Reach, attacking entities | yes | yes | **no** |
+
+Everything in that last block is decided by the server, so the menu greys those switches out
+and explains why on hover when the server has never heard of this mod. It knows because the
+network channel only reports connected when the server registered the same channel.
+
+That name carries a version (`modmenu.v2`), which means a server running a *different* build of
+this mod counts as not having it: the channel never pairs up, nothing is sent, and the
+server-decided toggles grey out. That is deliberate. Before it, a newer client sent feature ids
+an older server had no case for, the server threw inside its packet handler and disconnected the
+sender mid-join, and the client died in the texture atlas nowhere near the cause. Both halves
+have to be on the same build for the server-side features to work.
 
 The reasoning:
 
@@ -80,9 +102,9 @@ The reasoning:
   | Open / use a block | `HandleBlockInteract`, only when `AntiAbuse >= Basic` | full extra reach on a stock server |
   | Break or place | `TryModifyBlockInWorld`, only when `AntiAbuse >= Basic` | same |
   | Use an item on something | `HandleHandInteraction`, only when `AntiAbuse >= Basic` | same |
-  | **Attack an entity** | `HandleEntityInteraction`, **always** | capped at `2 x GetAttackRange` |
+  | **Attack an entity** | `HandleEntityInteraction`, **always**, plus a stricter client-side gate | capped at ~1.5 blocks unless the server runs this mod |
 
-  That last row is the one that does not bend. `HandleEntityInteraction` rejects an attack when
+  That last row is the one vanilla will not bend. `HandleEntityInteraction` rejects an attack when
   the entity's box is further than twice the held weapon's attack range from your eye, with no
   `AntiAbuse` condition on it and no privilege that skips it. Default attack range is 1.5, so
   killing things stops at about 3 blocks no matter where the slider sits. Right-clicking an
@@ -93,6 +115,23 @@ The reasoning:
   The server's copy of your picking range never changes, incidentally: `RequestModeChange` only
   accepts a new one from a player holding the `pickingrange` privilege, so every check above
   measures against the stock 4.5.
+
+  With the mod on both sides that row does bend, and without a switch of its own - but it takes
+  three separate lifts, because the swing is blocked in three places:
+
+  1. **The client never sends it.** `ClientMain.TryAttackEntity` measures the target against the
+     held weapon's attack range - not twice it - and simply skips the packet when it is further.
+     A stricter gate than the server's, and the one that matters first.
+  2. **The server cannot find the target.** `HandleEntityInteraction` looks for the entity within
+     `PickingRange + 10` before any range check runs, and the server's copy of picking range is
+     always the stock 4.5.
+  3. **The server rejects the distance**, the `2 x GetAttackRange` check above.
+
+  All three are answered by lifting `GetAttackRange` for the length of one swing, plus the
+  server's picking range for the length of one packet, both put straight back afterwards. A
+  prefix marks who is swinging and the other patches answer while the mark is set - the same
+  two-patch shape *Drops at player* uses, for the same reason: the value is decided somewhere
+  that has no idea which player it is for.
 - **Vein miner rides on that same client authority.** Every extra block goes through
   `ClientMain.OnPlayerTryDestroyBlock`, the one door a player-driven break uses, so the server
   sees nothing but an ordinary run of mining. Which is exactly why it is paced - see the

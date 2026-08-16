@@ -11,7 +11,21 @@ namespace ModMenu
 {
     public class ModMenuSystem : ModSystem
     {
-        public const string ChannelName = "modmenu";
+        /// <summary>
+        /// Versioned on purpose. The client and server only pair up a channel when the names
+        /// match exactly - HandleChannelsPacket compares nothing else, not the registered
+        /// message types - so bumping this is how the mod refuses to talk to a build it does
+        /// not share a protocol with.
+        ///
+        /// Without that, a newer client sends feature ids an older server has no case for, the
+        /// server throws inside its packet handler, and it disconnects the sender mid-join -
+        /// which lands on the client as a crash in the texture atlas, nowhere near the cause.
+        ///
+        /// Mismatched builds now simply find no channel: the server-decided toggles grey out,
+        /// which is the truth, and everything client-side carries on working. Bump this
+        /// whenever the packet contract changes, which includes adding EnumFeature values.
+        /// </summary>
+        public const string ChannelName = "modmenu.v2";
         private const string HotkeyCode = "modmenu.toggle";
         private const string ConfigFile = "modmenu.json";
         private const string HarmonyId = "com.br3zzly.modmenu";
@@ -112,20 +126,48 @@ namespace ModMenu
 
         private void OnTogglePacket(IServerPlayer fromPlayer, FeatureTogglePacket packet)
         {
-            ModMenuState.Set(fromPlayer.PlayerUID, packet.Feature, packet.Enabled);
+            // Nothing a client sends may take this handler down. An unhandled exception in here
+            // is not logged and shrugged off - the server disconnects the sender with "an action
+            // you (or your client) did caused an unhandled exception", which lands as a crash on
+            // a client still mid-join. Learned the hard way from a newer client sending feature
+            // ids an older server had no case for.
+            try
+            {
+                ModMenuState.Set(fromPlayer?.PlayerUID, packet.Feature, packet.Enabled);
+            }
+            catch (Exception e)
+            {
+                Mod.Logger.Warning("Ignoring a toggle from {0} that could not be applied: {1}",
+                    fromPlayer?.PlayerName ?? "?", e.Message);
+            }
         }
 
         private void OnLocalPlayerJoin(IClientPlayer player)
         {
             if (player.PlayerUID != capi.World.Player.PlayerUID) return;
 
-            ApplyFeature(EnumFeature.Invincible, Config.Invincible);
-            ApplyFeature(EnumFeature.InstantMine, Config.InstantMine);
-            ApplyFeature(EnumFeature.NoDurability, Config.NoDurabilityLoss);
-            ApplyFeature(EnumFeature.DropsAtPlayer, Config.DropsAtPlayer);
+            // Only what is actually on. The server starts a joining player with everything off
+            // and clears them again on disconnect, so telling it about a disabled feature says
+            // nothing it does not already assume - and every packet not sent is one that cannot
+            // upset a server on a different build.
+            SyncIfOn(EnumFeature.Invincible, Config.Invincible);
+            SyncIfOn(EnumFeature.InstantMine, Config.InstantMine);
+            SyncIfOn(EnumFeature.NoDurability, Config.NoDurabilityLoss);
+            SyncIfOn(EnumFeature.DropsAtPlayer, Config.DropsAtPlayer);
+            SyncIfOn(EnumFeature.OneHitKill, Config.OneHitKill);
+            SyncIfOn(EnumFeature.NoHunger, Config.NoHunger);
+            SyncIfOn(EnumFeature.FastPickup, Config.FastPickup);
+            ApplyRangedAttack();
 
             // Only now do the world's light tables exist to be flattened.
             if (Config.Fullbright) ApplyFullbright(true);
+        }
+
+        /// <summary>Records a feature locally, and tells the server only when it is on.</summary>
+        private void SyncIfOn(EnumFeature feature, bool enabled)
+        {
+            if (enabled) ApplyFeature(feature, true);
+            else ModMenuState.Set(capi.World.Player?.PlayerUID, feature, false);
         }
 
         // ---- reach -----------------------------------------------------------------
@@ -269,7 +311,28 @@ namespace ModMenu
         {
             return feature == EnumFeature.Invincible
                 || feature == EnumFeature.NoDurability
-                || feature == EnumFeature.DropsAtPlayer;
+                || feature == EnumFeature.DropsAtPlayer
+                || feature == EnumFeature.OneHitKill
+                || feature == EnumFeature.NoHunger
+                || feature == EnumFeature.FastPickup;
+        }
+
+        /// <summary>
+        /// Mirrors the reach setting to the server so it can let attacks reach as far as the
+        /// crosshair. Sent quietly: this follows the reach slider rather than a switch the
+        /// player pressed, and a chat line on every drag step would be noise.
+        /// </summary>
+        public void ApplyRangedAttack()
+        {
+            bool extended = Config.ReachBonus > 0;
+
+            // The client refuses to send a swing past the held weapon's range, so it has to
+            // reach further too - but only when the server would honour it. Otherwise the
+            // client plays the hit locally against a swing the server drops, which looks like
+            // a landed blow that did nothing.
+            Patches.RangedAttack.ClientEnabled = extended && ServerHasMod;
+
+            ApplyFeature(EnumFeature.RangedAttack, extended, announce: false);
         }
 
         /// <summary>
@@ -277,7 +340,7 @@ namespace ModMenu
         /// Stays client-only without throwing if the server does not have the channel - that
         /// is the normal case for a client-side install.
         /// </summary>
-        public void ApplyFeature(EnumFeature feature, bool enabled)
+        public void ApplyFeature(EnumFeature feature, bool enabled, bool announce = true)
         {
             string uid = capi.World.Player?.PlayerUID;
             if (uid == null) return;
@@ -288,7 +351,7 @@ namespace ModMenu
             {
                 clientChannel.SendPacket(new FeatureTogglePacket { Feature = feature, Enabled = enabled });
             }
-            else if (enabled && IsServerAuthoritative(feature))
+            else if (announce && enabled && IsServerAuthoritative(feature))
             {
                 // Say so rather than letting the switch sit on while nothing happens.
                 capi.ShowChatMessage(
@@ -304,6 +367,9 @@ namespace ModMenu
                 case EnumFeature.Invincible: return "Invincibility";
                 case EnumFeature.NoDurability: return "No durability loss";
                 case EnumFeature.DropsAtPlayer: return "Drops at player";
+                case EnumFeature.OneHitKill: return "One hit kill";
+                case EnumFeature.NoHunger: return "No hunger";
+                case EnumFeature.FastPickup: return "Faster pickup";
                 default: return "Instant mine";
             }
         }

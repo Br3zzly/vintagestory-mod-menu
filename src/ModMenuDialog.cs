@@ -1,24 +1,68 @@
+using System;
+using System.Collections.Generic;
 using System.Globalization;
 using Vintagestory.API.Client;
+using Vintagestory.API.Common;
 using Vintagestory.API.Config;
 using Vintagestory.API.MathTools;
 
 namespace ModMenu
 {
     /// <summary>
-    /// The Ctrl+Shift+M window. Kept deliberately plain: a column of switches for the
-    /// always-on toggles, a coordinate entry row, and three rename/save/go slots.
+    /// The F2 window. One tab per group of features, because as a single column it grew taller
+    /// than the screen once the GUI scale passed about 11.
+    ///
+    /// Each tab is a list of rows that know their own height before anything is composed, which
+    /// is what lets the layout decide how many columns it needs: at a large GUI scale even one
+    /// tab can outgrow the screen, and then the rows are dealt into a second column rather than
+    /// running off the bottom.
     /// </summary>
     public class ModMenuDialog : GuiDialog
     {
-        private const double DialogWidth = 420;
+        private const double ColumnWidth = 420;
+        private const double ColumnGap = 24;
         private const double RowHeight = 28;
         private const double RowGap = 6;
         private const double SwitchSize = 22;
+        private const double TitleBarHeight = 32;
+        private const double TabBarHeight = 32;
+
+        /// <summary>More than this and the window gets wider than it is tall, which reads worse.</summary>
+        private const int MaxColumnCount = 3;
+
+        private static readonly string[] TabNames = { "Player", "Movement", "Mining", "Teleport" };
+
+        /// <summary>Shown on the toggles the server decides, when the server has no idea we exist.</summary>
+        private const string ServerOnlyHint = "Only works when the mod is installed on the server";
+
+        /// <summary>Label colour for a toggle that cannot do anything right now.</summary>
+        private static readonly double[] DisabledTextColor = { 0.55, 0.55, 0.55, 1.0 };
+
+        /// <summary>Adds an element block at the given column offset and advances y past it.</summary>
+        private delegate void RowBuilder(GuiComposer composer, double x, ref double y);
+
+        /// <summary>
+        /// One block of the layout. The height is declared up front rather than discovered
+        /// while composing, so the column split can be worked out before a single element
+        /// exists.
+        /// </summary>
+        private sealed class Row
+        {
+            public readonly double Height;
+            public readonly RowBuilder Build;
+
+            public Row(double height, RowBuilder build)
+            {
+                Height = height;
+                Build = build;
+            }
+        }
 
         private readonly ModMenuSystem system;
 
         private double tpX, tpY, tpZ;
+
+        private int activeTab;
 
         /// <summary>
         /// Set while the fly speed slider moves, which fires on every step it passes. The
@@ -70,9 +114,69 @@ namespace ModMenu
             }
         }
 
+        // ---- layout ----------------------------------------------------------------
+
+        /// <summary>
+        /// Deals rows into columns, keeping their order and never spilling past
+        /// <paramref name="available"/> unless a single row is taller than that or the column
+        /// budget runs out. Pure arithmetic, so it can be exercised without a screen.
+        /// </summary>
+        internal static int[] ColumnAssignment(IList<double> heights, double available, int maxColumns)
+        {
+            var assignment = new int[heights.Count];
+            int column = 0;
+            double used = 0;
+
+            for (int i = 0; i < heights.Count; i++)
+            {
+                // Never open a column with nothing in the previous one, and never open one
+                // past the budget - the last column takes the overflow instead.
+                if (used > 0 && column < maxColumns - 1 && used + heights[i] > available)
+                {
+                    column++;
+                    used = 0;
+                }
+
+                assignment[i] = column;
+                used += heights[i];
+            }
+
+            return assignment;
+        }
+
+        /// <summary>Screen height left for rows once the window's own furniture is paid for.</summary>
+        private double AvailableHeight()
+        {
+            double screen = capi.Render.FrameHeight / RuntimeEnv.GUIScale;
+            double furniture = TitleBarHeight + TabBarHeight + RowGap * 2
+                             + GuiStyle.ElementToDialogPadding * 2 + 60;
+
+            return Math.Max(160, screen - furniture);
+        }
+
+        private int MaxColumns()
+        {
+            double screen = capi.Render.FrameWidth / RuntimeEnv.GUIScale;
+            int fits = (int)((screen - 60) / (ColumnWidth + ColumnGap));
+
+            return GameMath.Clamp(fits, 1, MaxColumnCount);
+        }
+
         private void Compose()
         {
             CairoFont font = CairoFont.WhiteSmallText();
+
+            activeTab = GameMath.Clamp(activeTab, 0, TabNames.Length - 1);
+
+            List<Row> rows = RowsForTab(activeTab, font);
+
+            var heights = new double[rows.Count];
+            for (int i = 0; i < rows.Count; i++) heights[i] = rows[i].Height;
+
+            int[] assignment = ColumnAssignment(heights, AvailableHeight(), MaxColumns());
+            int columnCount = rows.Count == 0 ? 1 : assignment[rows.Count - 1] + 1;
+
+            double contentWidth = columnCount * ColumnWidth + (columnCount - 1) * ColumnGap;
 
             ElementBounds dialogBounds = ElementStdBounds.AutosizedMainDialog
                 .WithAlignment(EnumDialogArea.CenterMiddle);
@@ -80,100 +184,94 @@ namespace ModMenu
             ElementBounds bgBounds = ElementBounds.Fill.WithFixedPadding(GuiStyle.ElementToDialogPadding);
             bgBounds.BothSizing = ElementSizing.FitToChildren;
 
-            double y = 0;
-
             GuiComposer composer = capi.Gui
                 .CreateCompo("modmenu-main", dialogBounds)
                 .AddShadedDialogBG(bgBounds)
                 .AddDialogTitleBar("Mod Menu", OnTitleBarClose, font, null, null)
                 .BeginChildElements(bgBounds);
 
-            y += 32;
+            double top = TitleBarHeight;
 
-            // ---- toggles ----------------------------------------------------------
-
-            composer = AddSectionHeader(composer, font, "Features", ref y);
-
-            // Invincibility and durability are server-decided, so on a server without this mod
-            // those two switches cannot do anything. Say so up front rather than letting them
-            // look broken.
-            if (!system.ServerHasMod)
+            var tabs = new GuiTab[TabNames.Length];
+            for (int i = 0; i < TabNames.Length; i++)
             {
-                const string notice = "Server does not have this mod - invincibility, durability "
-                                    + "and drops at player are inactive.";
-                CairoFont noticeFont = CairoFont.WhiteDetailText().WithColor(GuiStyle.ErrorTextColor);
-
-                // The notice wraps to more than one line, so measure its wrapped height at the
-                // current scale rather than reserving a single row and letting it clip into
-                // the toggle below. GetMultilineTextHeight works in scaled pixels; bounds want
-                // unscaled units, hence dividing the scale back out.
-                double noticeHeight = capi.Gui.Text.GetMultilineTextHeight(
-                    noticeFont, notice, GuiElement.scaled(DialogWidth)) / RuntimeEnv.GUIScale;
-
-                composer.AddStaticText(notice, noticeFont,
-                    ElementBounds.Fixed(0, y, DialogWidth, noticeHeight), null);
-                y += noticeHeight + RowGap * 2;
+                tabs[i] = new GuiTab { Name = TabNames[i], DataInt = i };
             }
 
-            // Server-authoritative toggles first: they only do anything when the server also
-            // runs this mod. See the notice above when it does not.
-            composer = AddToggleRow(composer, font, "Invincibility", "swInvincible", ref y,
-                on =>
-                {
-                    Config.Invincible = on;
-                    system.ApplyFeature(EnumFeature.Invincible, on);
-                    system.SaveConfig();
-                });
+            composer.AddHorizontalTabs(tabs,
+                ElementBounds.Fixed(0, top, contentWidth, TabBarHeight),
+                OnTabClicked,
+                font,
+                font.Clone().WithWeight(Cairo.FontWeight.Bold),
+                "tabs");
 
-            composer = AddToggleRow(composer, font, "No durability loss", "swNoDurability", ref y,
-                on =>
-                {
-                    Config.NoDurabilityLoss = on;
-                    system.ApplyFeature(EnumFeature.NoDurability, on);
-                    system.SaveConfig();
-                });
+            top += TabBarHeight + RowGap * 2;
 
-            composer = AddToggleRow(composer, font, "Drops at player", "swDropsAtPlayer", ref y,
-                on =>
-                {
-                    Config.DropsAtPlayer = on;
-                    system.ApplyFeature(EnumFeature.DropsAtPlayer, on);
-                    system.SaveConfig();
-                });
+            // Every column starts level with the tab strip; rows carry their own x offset so
+            // the same builder works in any column.
+            var columnY = new double[columnCount];
+            for (int i = 0; i < columnCount; i++) columnY[i] = top;
 
-            // Divider between the server-dependent toggles above and the ones below that work
-            // on any server, mod or not.
-            composer = AddDivider(composer, ref y);
+            for (int i = 0; i < rows.Count; i++)
+            {
+                int column = assignment[i];
+                double x = column * (ColumnWidth + ColumnGap);
 
-            composer = AddToggleRow(composer, font, "Instant mine", "swInstantMine", ref y,
-                on =>
+                rows[i].Build(composer, x, ref columnY[column]);
+            }
+
+            SingleComposer = composer.EndChildElements().Compose();
+
+            GuiElementHorizontalTabs tabElem = SingleComposer.GetHorizontalTabs("tabs");
+            if (tabElem != null) tabElem.activeElement = activeTab;
+
+            ApplyCurrentValues();
+        }
+
+        private void OnTabClicked(int index)
+        {
+            activeTab = index;
+            Compose();
+        }
+
+        // ---- the tabs --------------------------------------------------------------
+
+        private List<Row> RowsForTab(int tab, CairoFont font)
+        {
+            switch (tab)
+            {
+                case 0: return PlayerRows(font);
+                case 1: return MovementRows(font);
+                case 2: return MiningRows(font);
+                default: return TeleportRows(font);
+            }
+        }
+
+        private List<Row> MiningRows(CairoFont font)
+        {
+            return new List<Row>
+            {
+                ToggleRow(font, "Instant mine", "swInstantMine", on =>
                 {
                     Config.InstantMine = on;
                     system.ApplyFeature(EnumFeature.InstantMine, on);
                     system.SaveConfig();
-                });
+                }),
 
-            composer = AddToggleRow(composer, font, "Vein miner", "swVeinMiner", ref y,
-                on =>
+                ToggleRow(font, "Vein miner", "swVeinMiner", on =>
                 {
                     Config.VeinMiner = on;
                     system.SaveConfig();
-                });
+                }),
 
-            // Vein miner limit. Whole blocks, so the slider carries the value as it is.
-            composer
-                .AddStaticText("Blocks per vein", font, ElementBounds.Fixed(0, y, 200, RowHeight), null)
-                .AddSlider(v =>
+                SliderRow(font, "Blocks per vein", "sldVeinLimit", v =>
                 {
                     Config.VeinMinerLimit = v;
                     veinLimitUnsaved = true;
                     return true;
-                }, ElementBounds.Fixed(210, y + 4, 190, 20), "sldVeinLimit");
+                }),
 
-            y += RowHeight + RowGap;
-
-            composer = AddToggleRow(composer, font, "AntiAbuse Safe", "swVeinBanSafe", ref y,
-                on =>
+                ToggleRow(font, "AntiAbuse Safe", "swVeinBanSafe", on =>
                 {
                     Config.VeinMinerBanSafe = on;
                     system.SaveConfig();
@@ -188,193 +286,315 @@ namespace ModMenu
                             + "seconds - by default for 14 days. Safe in singleplayer and on "
                             + "servers that leave anti abuse off, which is the stock setting.");
                     }
-                });
+                }),
 
-            // Divider between the mining group above and the movement group below.
-            composer = AddDivider(composer, ref y);
+                ToggleRow(font, "No durability loss", "swNoDurability", on =>
+                {
+                    Config.NoDurabilityLoss = on;
+                    system.ApplyFeature(EnumFeature.NoDurability, on);
+                    system.SaveConfig();
+                }, needsServerMod: true),
 
-            composer = AddToggleRow(composer, font, "Flight", "swFlight", ref y,
-                on =>
+                ToggleRow(font, "Drops at player", "swDropsAtPlayer", on =>
+                {
+                    Config.DropsAtPlayer = on;
+                    system.ApplyFeature(EnumFeature.DropsAtPlayer, on);
+                    system.SaveConfig();
+                }, needsServerMod: true),
+
+                ToggleRow(font, "Faster pickup", "swFastPickup", on =>
+                {
+                    Config.FastPickup = on;
+                    system.ApplyFeature(EnumFeature.FastPickup, on);
+                    system.SaveConfig();
+                }, needsServerMod: true)
+            };
+        }
+
+        private List<Row> MovementRows(CairoFont font)
+        {
+            return new List<Row>
+            {
+                ToggleRow(font, "Flight", "swFlight", on =>
                 {
                     Config.Flight = on;
                     system.SaveConfig();
-                });
+                }),
 
-            composer = AddToggleRow(composer, font, "No clip", "swNoClip", ref y,
-                on =>
+                ToggleRow(font, "No clip", "swNoClip", on =>
                 {
                     Config.NoClip = on;
                     system.SaveConfig();
-                });
+                }),
 
-            composer = AddToggleRow(composer, font, "No fall damage", "swNoFallDamage", ref y,
-                on =>
+                ToggleRow(font, "No fall damage", "swNoFallDamage", on =>
                 {
                     Config.NoFallDamage = on;
                     system.SaveConfig();
-                });
+                }),
 
-            // Fly speed. A slider rather than a number box, because the ceiling here is a real
-            // limit and not a preference - past 3 the fall catch can no longer keep a landing
-            // gentle - and a text field can always be typed past whatever range it advertises.
-            // The slider itself only carries whole numbers, so it counts tenths.
-            composer
-                .AddStaticText("Fly speed", font, ElementBounds.Fixed(0, y, 200, RowHeight), null)
-                .AddSlider(v =>
+                // Fly speed. A slider rather than a number box, because the ceiling here is a
+                // real limit and not a preference - past 3 the fall catch can no longer keep a
+                // landing gentle - and a text field can always be typed past its range. The
+                // slider itself only carries whole numbers, so it counts tenths.
+                SliderRow(font, "Fly speed", "sldFlySpeed", v =>
                 {
                     Config.FlySpeed = v / (double)ModMenuConfig.FlySpeedSteps;
                     flySpeedUnsaved = true;
                     return true;
-                }, ElementBounds.Fixed(210, y + 4, 190, 20), "sldFlySpeed");
+                })
+            };
+        }
 
-            y += RowHeight + RowGap;
+        private List<Row> PlayerRows(CairoFont font)
+        {
+            return new List<Row>
+            {
+                ToggleRow(font, "Invincibility", "swInvincible", on =>
+                {
+                    Config.Invincible = on;
+                    system.ApplyFeature(EnumFeature.Invincible, on);
+                    system.SaveConfig();
+                }, needsServerMod: true),
 
-            // Divider between the movement toggles above and fullbright below.
-            composer = AddDivider(composer, ref y);
+                ToggleRow(font, "One hit kill", "swOneHitKill", on =>
+                {
+                    Config.OneHitKill = on;
+                    system.ApplyFeature(EnumFeature.OneHitKill, on);
+                    system.SaveConfig();
+                }, needsServerMod: true),
 
-            composer = AddToggleRow(composer, font, "Fullbright", "swFullbright", ref y,
-                on =>
+                ToggleRow(font, "No hunger", "swNoHunger", on =>
+                {
+                    Config.NoHunger = on;
+                    system.ApplyFeature(EnumFeature.NoHunger, on);
+                    system.SaveConfig();
+                }, needsServerMod: true),
+
+                ToggleRow(font, "Fullbright", "swFullbright", on =>
                 {
                     Config.Fullbright = on;
                     system.ApplyFullbright(on);
                     system.SaveConfig();
-                });
+                }),
 
-            // Reach. Whole blocks on top of whatever the game gives you, so zero is "untouched".
-            composer
-                .AddStaticText("Reach", font, ElementBounds.Fixed(0, y, 200, RowHeight), null)
-                .AddSlider(v =>
+                // Reach. Whole blocks on top of whatever the game gives you, so zero is
+                // "untouched".
+                SliderRow(font, "Reach", "sldReach", v =>
                 {
+                    bool wasExtended = Config.ReachBonus > 0;
                     Config.ReachBonus = v;
                     reachUnsaved = true;
+
+                    // Attacks reach as far as the crosshair only if the server knows reach is
+                    // extended, so tell it - but only when that actually changed, not on every
+                    // step of the drag.
+                    if (wasExtended != (v > 0)) system.ApplyRangedAttack();
+
                     return true;
-                }, ElementBounds.Fixed(210, y + 4, 190, 20), "sldReach");
+                })
+            };
+        }
 
-            y += RowHeight + RowGap;
-
-            // Divider between fullbright above and the teleport controls below.
-            composer = AddDivider(composer, ref y);
-
-            // ---- teleport to coordinates -------------------------------------------
-
-            composer = AddSectionHeader(composer, font, "Teleport to coordinates", ref y);
-
-            composer
-                .AddStaticText("X", font, ElementBounds.Fixed(0, y, 14, RowHeight), null)
-                .AddNumberInput(ElementBounds.Fixed(16, y, 110, RowHeight),
-                    t => ParseInto(t, ref tpX), font, "fdX")
-                .AddStaticText("Y", font, ElementBounds.Fixed(140, y, 14, RowHeight), null)
-                .AddNumberInput(ElementBounds.Fixed(156, y, 110, RowHeight),
-                    t => ParseInto(t, ref tpY), font, "fdY")
-                .AddStaticText("Z", font, ElementBounds.Fixed(280, y, 14, RowHeight), null)
-                .AddNumberInput(ElementBounds.Fixed(296, y, 110, RowHeight),
-                    t => ParseInto(t, ref tpZ), font, "fdZ");
-
-            y += RowHeight + RowGap;
-
-            composer.AddButton("Teleport", () =>
+        private List<Row> TeleportRows(CairoFont font)
+        {
+            var rows = new List<Row>
             {
-                system.TeleportToRelative(tpX, tpY, tpZ);
-                return true;
-            }, ElementBounds.Fixed(0, y, DialogWidth, RowHeight + 4), EnumButtonStyle.Normal, "btnTeleport");
+                HeaderRow(font, "Teleport to coordinates"),
 
-            y += RowHeight + RowGap * 3;
+                new Row(RowHeight + RowGap, delegate (GuiComposer c, double x, ref double y)
+                {
+                    c.AddStaticText("X", font, ElementBounds.Fixed(x, y, 14, RowHeight), null)
+                     .AddNumberInput(ElementBounds.Fixed(x + 16, y, 110, RowHeight),
+                         t => ParseInto(t, ref tpX), font, "fdX")
+                     .AddStaticText("Y", font, ElementBounds.Fixed(x + 140, y, 14, RowHeight), null)
+                     .AddNumberInput(ElementBounds.Fixed(x + 156, y, 110, RowHeight),
+                         t => ParseInto(t, ref tpY), font, "fdY")
+                     .AddStaticText("Z", font, ElementBounds.Fixed(x + 280, y, 14, RowHeight), null)
+                     .AddNumberInput(ElementBounds.Fixed(x + 296, y, 110, RowHeight),
+                         t => ParseInto(t, ref tpZ), font, "fdZ");
 
-            // ---- saved locations ----------------------------------------------------
+                    y += RowHeight + RowGap;
+                }),
 
-            composer = AddSectionHeader(composer, font, "Saved locations", ref y);
+                new Row(RowHeight + RowGap * 3, delegate (GuiComposer c, double x, ref double y)
+                {
+                    c.AddButton("Teleport", () =>
+                    {
+                        system.TeleportToRelative(tpX, tpY, tpZ);
+                        return true;
+                    }, ElementBounds.Fixed(x, y, ColumnWidth, RowHeight + 4), EnumButtonStyle.Normal, "btnTeleport");
+
+                    y += RowHeight + RowGap * 3;
+                }),
+
+                HeaderRow(font, "Saved locations")
+            };
 
             for (int i = 0; i < 3; i++)
             {
                 int slot = i; // capture per iteration, not the shared loop variable
 
-                composer
-                    .AddTextInput(ElementBounds.Fixed(0, y, 180, RowHeight),
-                        text =>
-                        {
-                            Config.Locations[slot].Name = string.IsNullOrWhiteSpace(text)
-                                ? "Slot " + (slot + 1)
-                                : text;
-                            system.SaveConfig();
-                        }, font, "tfName" + slot)
-                    .AddButton("Save", () =>
+                rows.Add(new Row(RowHeight + RowGap + 20 + RowGap,
+                    delegate (GuiComposer c, double x, ref double y)
                     {
-                        system.SaveCurrentPosition(slot);
-                        RefreshSlotLabels();
-                        return true;
-                    }, ElementBounds.Fixed(190, y, 100, RowHeight + 4), EnumButtonStyle.Normal, "btnSave" + slot)
-                    .AddButton("Go", () =>
-                    {
-                        system.TeleportToSaved(slot);
-                        return true;
-                    }, ElementBounds.Fixed(300, y, 100, RowHeight + 4), EnumButtonStyle.Normal, "btnGo" + slot);
+                        c.AddTextInput(ElementBounds.Fixed(x, y, 180, RowHeight),
+                            text =>
+                            {
+                                Config.Locations[slot].Name = string.IsNullOrWhiteSpace(text)
+                                    ? "Slot " + (slot + 1)
+                                    : text;
+                                system.SaveConfig();
+                            }, font, "tfName" + slot)
+                         .AddButton("Save", () =>
+                         {
+                             system.SaveCurrentPosition(slot);
+                             RefreshSlotLabels();
+                             return true;
+                         }, ElementBounds.Fixed(x + 190, y, 100, RowHeight + 4), EnumButtonStyle.Normal, "btnSave" + slot)
+                         .AddButton("Go", () =>
+                         {
+                             system.TeleportToSaved(slot);
+                             return true;
+                         }, ElementBounds.Fixed(x + 300, y, 100, RowHeight + 4), EnumButtonStyle.Normal, "btnGo" + slot);
 
-                y += RowHeight + RowGap;
+                        y += RowHeight + RowGap;
 
-                composer.AddStaticText(SlotCoordsLabel(slot), CairoFont.WhiteDetailText(),
-                    ElementBounds.Fixed(0, y, DialogWidth, 20), "txtCoords" + slot);
+                        c.AddStaticText(SlotCoordsLabel(slot), CairoFont.WhiteDetailText(),
+                            ElementBounds.Fixed(x, y, ColumnWidth, 20), "txtCoords" + slot);
 
-                y += 20 + RowGap;
+                        y += 20 + RowGap;
+                    }));
             }
 
-            SingleComposer = composer.EndChildElements().Compose();
-
-            ApplyCurrentValues();
+            return rows;
         }
 
+        // ---- row kinds -------------------------------------------------------------
+
         /// <summary>
-        /// Pushes config state into the freshly composed widgets. Has to run after Compose,
-        /// since the elements do not exist before that.
+        /// A labelled switch. Rows marked <paramref name="needsServerMod"/> are the ones the
+        /// server decides - invincibility, durability, drop placement - so when the server has
+        /// never heard of this mod they are greyed out, made unclickable and given a hover
+        /// hint, rather than sitting there looking functional and doing nothing.
+        /// </summary>
+        private Row ToggleRow(CairoFont font, string label, string key, Action<bool> onToggle,
+            bool needsServerMod = false)
+        {
+            bool inert = needsServerMod && !system.ServerHasMod;
+            CairoFont labelFont = inert ? font.Clone().WithColor(DisabledTextColor) : font;
+
+            return new Row(RowHeight + RowGap, delegate (GuiComposer c, double x, ref double y)
+            {
+                c.AddStaticText(label, labelFont, ElementBounds.Fixed(x, y, 300, RowHeight), null)
+                 .AddSwitch(onToggle, ElementBounds.Fixed(x + 320, y, SwitchSize, SwitchSize), key, SwitchSize, 4);
+
+                if (inert)
+                {
+                    // Before the composer runs: the switch bakes its dimmed look during
+                    // ComposeElements, and its click handler ignores presses while disabled.
+                    GuiElementSwitch element = c.GetSwitch(key);
+                    if (element != null) element.Enabled = false;
+
+                    // Covers the label and the switch, so the hint appears anywhere on the row.
+                    c.AddHoverText(ServerOnlyHint, font, 260,
+                        ElementBounds.Fixed(x, y, 320 + SwitchSize, RowHeight));
+                }
+
+                y += RowHeight + RowGap;
+            });
+        }
+
+        private Row SliderRow(CairoFont font, string label, string key, ActionConsumable<int> onChanged)
+        {
+            return new Row(RowHeight + RowGap, delegate (GuiComposer c, double x, ref double y)
+            {
+                c.AddStaticText(label, font, ElementBounds.Fixed(x, y, 200, RowHeight), null)
+                 .AddSlider(onChanged, ElementBounds.Fixed(x + 210, y + 4, 190, 20), key);
+
+                y += RowHeight + RowGap;
+            });
+        }
+
+        private Row HeaderRow(CairoFont font, string title)
+        {
+            CairoFont bold = font.Clone().WithWeight(Cairo.FontWeight.Bold);
+
+            return new Row(RowHeight, delegate (GuiComposer c, double x, ref double y)
+            {
+                c.AddStaticText(title, bold, ElementBounds.Fixed(x, y, ColumnWidth, RowHeight), null);
+                y += RowHeight;
+            });
+        }
+
+        // ---- state -----------------------------------------------------------------
+
+        /// <summary>
+        /// Pushes config state into the freshly composed widgets. Everything is looked up
+        /// defensively, because only the active tab's elements exist.
         /// </summary>
         private void ApplyCurrentValues()
         {
-            SingleComposer.GetSwitch("swInvincible").On = Config.Invincible;
-            SingleComposer.GetSwitch("swInstantMine").On = Config.InstantMine;
-            SingleComposer.GetSwitch("swNoDurability").On = Config.NoDurabilityLoss;
-            SingleComposer.GetSwitch("swFlight").On = Config.Flight;
-            SingleComposer.GetSwitch("swNoClip").On = Config.NoClip;
-            SingleComposer.GetSwitch("swNoFallDamage").On = Config.NoFallDamage;
-            SingleComposer.GetSwitch("swFullbright").On = Config.Fullbright;
-            SingleComposer.GetSwitch("swVeinMiner").On = Config.VeinMiner;
-            SingleComposer.GetSwitch("swVeinBanSafe").On = Config.VeinMinerBanSafe;
-            SingleComposer.GetSwitch("swDropsAtPlayer").On = Config.DropsAtPlayer;
+            SetSwitch("swInvincible", Config.Invincible);
+            SetSwitch("swNoDurability", Config.NoDurabilityLoss);
+            SetSwitch("swDropsAtPlayer", Config.DropsAtPlayer);
+            SetSwitch("swInstantMine", Config.InstantMine);
+            SetSwitch("swVeinMiner", Config.VeinMiner);
+            SetSwitch("swVeinBanSafe", Config.VeinMinerBanSafe);
+            SetSwitch("swFlight", Config.Flight);
+            SetSwitch("swNoClip", Config.NoClip);
+            SetSwitch("swNoFallDamage", Config.NoFallDamage);
+            SetSwitch("swFullbright", Config.Fullbright);
+            SetSwitch("swOneHitKill", Config.OneHitKill);
+            SetSwitch("swNoHunger", Config.NoHunger);
+            SetSwitch("swFastPickup", Config.FastPickup);
 
             // The tooltip has to be in place before SetValues, which is what bakes the value
-            // label into a texture. Leaving ShowTextWhenResting off keeps the speed out of the
+            // label into a texture. Leaving ShowTextWhenResting off keeps the value out of the
             // slider track itself - it only appears in the bubble above the handle while that
             // is being dragged or hovered.
-            GuiElementSlider flySpeed = SingleComposer.GetSlider("sldFlySpeed");
-            flySpeed.OnSliderTooltip = v => Fmt(v / (double)ModMenuConfig.FlySpeedSteps) + "x";
-            flySpeed.SetValues(
-                Tenths(Config.FlySpeed),
-                Tenths(ModMenuConfig.MinFlySpeed),
-                Tenths(ModMenuConfig.MaxFlySpeed),
-                1);
+            SetSlider("sldFlySpeed", Tenths(Config.FlySpeed),
+                Tenths(ModMenuConfig.MinFlySpeed), Tenths(ModMenuConfig.MaxFlySpeed),
+                v => Fmt(v / (double)ModMenuConfig.FlySpeedSteps) + "x");
 
-            GuiElementSlider veinLimit = SingleComposer.GetSlider("sldVeinLimit");
-            veinLimit.OnSliderTooltip = v => v + (v == 1 ? " block" : " blocks");
-            veinLimit.SetValues(
-                Config.VeinMinerLimit,
-                ModMenuConfig.MinVeinMinerLimit,
-                ModMenuConfig.MaxVeinMinerLimit,
-                1);
+            SetSlider("sldVeinLimit", Config.VeinMinerLimit,
+                ModMenuConfig.MinVeinMinerLimit, ModMenuConfig.MaxVeinMinerLimit,
+                v => v + (v == 1 ? " block" : " blocks"));
 
-            GuiElementSlider reach = SingleComposer.GetSlider("sldReach");
-            reach.OnSliderTooltip = v => v == 0 ? "normal" : "+" + v + " blocks";
-            reach.SetValues(
-                Config.ReachBonus,
-                ModMenuConfig.MinReachBonus,
-                ModMenuConfig.MaxReachBonus,
-                1);
+            SetSlider("sldReach", Config.ReachBonus,
+                ModMenuConfig.MinReachBonus, ModMenuConfig.MaxReachBonus,
+                v => v == 0 ? "normal" : "+" + v + " blocks");
 
-            SingleComposer.GetNumberInput("fdX").SetValue(Fmt(tpX));
-            SingleComposer.GetNumberInput("fdY").SetValue(Fmt(tpY));
-            SingleComposer.GetNumberInput("fdZ").SetValue(Fmt(tpZ));
+            SetNumberInput("fdX", tpX);
+            SetNumberInput("fdY", tpY);
+            SetNumberInput("fdZ", tpZ);
 
             for (int i = 0; i < 3; i++)
             {
-                SingleComposer.GetTextInput("tfName" + i).SetValue(Config.Locations[i].Name);
+                GuiElementTextInput name = SingleComposer.GetTextInput("tfName" + i);
+                if (name != null) name.SetValue(Config.Locations[i].Name);
             }
+        }
+
+        private void SetSwitch(string key, bool on)
+        {
+            GuiElementSwitch element = SingleComposer.GetSwitch(key);
+            if (element != null) element.On = on;
+        }
+
+        private void SetSlider(string key, int value, int min, int max, SliderTooltipDelegate tooltip)
+        {
+            GuiElementSlider slider = SingleComposer.GetSlider(key);
+            if (slider == null) return;
+
+            slider.OnSliderTooltip = tooltip;
+            slider.SetValues(value, min, max, 1);
+        }
+
+        private void SetNumberInput(string key, double value)
+        {
+            GuiElementNumberInput input = SingleComposer.GetNumberInput(key);
+            if (input != null) input.SetValue(Fmt(value));
         }
 
         /// <summary>
@@ -393,34 +613,6 @@ namespace ModMenu
             return $"    {rel.X:0.#}, {rel.Y:0.#}, {rel.Z:0.#}";
         }
 
-        private GuiComposer AddSectionHeader(GuiComposer composer, CairoFont font, string title, ref double y)
-        {
-            composer.AddStaticText(title, font.Clone().WithWeight(Cairo.FontWeight.Bold),
-                ElementBounds.Fixed(0, y, DialogWidth, RowHeight), null);
-            y += RowHeight;
-            return composer;
-        }
-
-        /// <summary>A thin engraved inset used as a horizontal separator between toggle groups.</summary>
-        private GuiComposer AddDivider(GuiComposer composer, ref double y)
-        {
-            y += RowGap;
-            composer.AddInset(ElementBounds.Fixed(0, y, DialogWidth, 4), 3);
-            y += 4 + RowGap * 2;
-            return composer;
-        }
-
-        private GuiComposer AddToggleRow(GuiComposer composer, CairoFont font, string label, string key,
-            ref double y, System.Action<bool> onToggle)
-        {
-            composer
-                .AddStaticText(label, font, ElementBounds.Fixed(0, y, 300, RowHeight), null)
-                .AddSwitch(onToggle, ElementBounds.Fixed(320, y, SwitchSize, SwitchSize), key, SwitchSize, 4);
-
-            y += RowHeight + RowGap;
-            return composer;
-        }
-
         private static void ParseInto(string text, ref double target)
         {
             if (double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out double v))
@@ -433,7 +625,7 @@ namespace ModMenu
 
         /// <summary>A fly speed as the whole number the slider carries it in.</summary>
         private static int Tenths(double flySpeed)
-            => (int)System.Math.Round(flySpeed * ModMenuConfig.FlySpeedSteps);
+            => (int)Math.Round(flySpeed * ModMenuConfig.FlySpeedSteps);
 
         private void OnTitleBarClose() => TryClose();
 

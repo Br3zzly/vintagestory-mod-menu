@@ -24,6 +24,10 @@ namespace ModMenu
         private static readonly HashSet<string> instantMine = new HashSet<string>();
         private static readonly HashSet<string> noDurability = new HashSet<string>();
         private static readonly HashSet<string> dropsAtPlayer = new HashSet<string>();
+        private static readonly HashSet<string> oneHitKill = new HashSet<string>();
+        private static readonly HashSet<string> noHunger = new HashSet<string>();
+        private static readonly HashSet<string> fastPickup = new HashSet<string>();
+        private static readonly HashSet<string> rangedAttack = new HashSet<string>();
 
         private static readonly object sync = new object();
 
@@ -34,6 +38,8 @@ namespace ModMenu
             lock (sync)
             {
                 HashSet<string> set = SetFor(feature);
+                if (set == null) return;
+
                 if (enabled) set.Add(playerUid);
                 else set.Remove(playerUid);
             }
@@ -45,7 +51,8 @@ namespace ModMenu
 
             lock (sync)
             {
-                return SetFor(feature).Contains(playerUid);
+                HashSet<string> set = SetFor(feature);
+                return set != null && set.Contains(playerUid);
             }
         }
 
@@ -60,6 +67,10 @@ namespace ModMenu
                 instantMine.Remove(playerUid);
                 noDurability.Remove(playerUid);
                 dropsAtPlayer.Remove(playerUid);
+                oneHitKill.Remove(playerUid);
+                noHunger.Remove(playerUid);
+                fastPickup.Remove(playerUid);
+                rangedAttack.Remove(playerUid);
             }
         }
 
@@ -78,9 +89,18 @@ namespace ModMenu
                 case EnumFeature.InstantMine: return instantMine;
                 case EnumFeature.NoDurability: return noDurability;
                 case EnumFeature.DropsAtPlayer: return dropsAtPlayer;
-                // Deliberately not a silent fallback: a feature added to the enum without a set
-                // of its own would otherwise read and write somebody else's toggle.
-                default: throw new System.ArgumentOutOfRangeException(nameof(feature));
+                case EnumFeature.OneHitKill: return oneHitKill;
+                case EnumFeature.NoHunger: return noHunger;
+                case EnumFeature.FastPickup: return fastPickup;
+                case EnumFeature.RangedAttack: return rangedAttack;
+
+                // Null rather than a fallback set, because aliasing one feature onto another
+                // would silently flip the wrong toggle - and null rather than an exception,
+                // because these values arrive over the network. A client running a newer build
+                // sends features an older server has never heard of, and throwing here means an
+                // unhandled exception inside a packet handler, which disconnects that player
+                // mid-join. Unknown features are simply not ours to track.
+                default: return null;
             }
         }
     }
@@ -90,7 +110,16 @@ namespace ModMenu
         Invincible,
         InstantMine,
         NoDurability,
-        DropsAtPlayer
+        DropsAtPlayer,
+        OneHitKill,
+        NoHunger,
+        FastPickup,
+
+        /// <summary>
+        /// Not a toggle of its own: the client reports this whenever its reach is extended, so
+        /// the server can let attacks reach as far as the crosshair does.
+        /// </summary>
+        RangedAttack
     }
 
     /// <summary>Sent client -> server whenever a server-authoritative toggle flips.</summary>
