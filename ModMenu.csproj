@@ -68,12 +68,50 @@
   -->
   <PropertyGroup>
     <PackageStaging>$(MSBuildProjectDirectory)\obj\package</PackageStaging>
-    <PackageZip>$(MSBuildProjectDirectory)\dist\$(AssemblyName).zip</PackageZip>
   </PropertyGroup>
 
-  <Target Name="PackageMod" AfterTargets="Build">
+  <!--
+    The zip carries the version, so a download says which one it is and two of them can sit in a
+    downloads folder without one silently replacing the other.
+
+    modinfo.json is the single source of truth for that version - it is what the game reads - so
+    the name is derived from it rather than kept in step by hand. Read line by line and matched
+    on one short line, which survives the description gaining punctuation that would upset a
+    regex over the whole file.
+  -->
+  <Target Name="ReadModVersion" BeforeTargets="PackageMod;Deploy" Condition="'$(ModVersion)' == ''">
+    <ReadLinesFromFile File="$(MSBuildProjectDirectory)\modinfo.json">
+      <Output TaskParameter="Lines" ItemName="ModInfoLine" />
+    </ReadLinesFromFile>
+
+    <ItemGroup>
+      <ModVersionLine Include="@(ModInfoLine)"
+                      Condition="$([System.String]::Copy('%(Identity)').Trim().StartsWith('&quot;version&quot;'))" />
+    </ItemGroup>
+
+    <!--
+      Via a property rather than straight from the item: an @(item) written inside a property
+      function's arguments comes through empty, so the line has to land somewhere first.
+    -->
+    <PropertyGroup>
+      <ModVersionText>@(ModVersionLine)</ModVersionText>
+      <ModVersion>$([System.Text.RegularExpressions.Regex]::Match($(ModVersionText), '[0-9][0-9.]*').Value)</ModVersion>
+      <PackageZip>$(MSBuildProjectDirectory)\dist\$(AssemblyName)_$(ModVersion).zip</PackageZip>
+    </PropertyGroup>
+
+    <Error Condition="'$(ModVersion)' == ''"
+           Text="Could not read &quot;version&quot; out of modinfo.json, so the zip cannot be named after it." />
+  </Target>
+
+  <Target Name="PackageMod" AfterTargets="Build" DependsOnTargets="ReadModVersion">
     <RemoveDir Directories="$(PackageStaging)" />
     <MakeDir Directories="$(PackageStaging);$(MSBuildProjectDirectory)\dist" />
+
+    <!-- Older builds' zips, so dist only ever holds the one just built. -->
+    <ItemGroup>
+      <StaleZip Include="$(MSBuildProjectDirectory)\dist\$(AssemblyName)*.zip" Exclude="$(PackageZip)" />
+    </ItemGroup>
+    <Delete Files="@(StaleZip)" />
 
     <Copy SourceFiles="$(TargetPath);$(MSBuildProjectDirectory)\modinfo.json"
           DestinationFolder="$(PackageStaging)" />
@@ -129,21 +167,31 @@
       Vintage Story leaves the unpacked dll read-only, which RemoveDir cannot get past on
       its own, so drop the attribute across the whole tree first.
     -->
-    <Exec Command="attrib -R &quot;$(VintagestoryDataDir)\Cache\unpack\$(AssemblyName).zip_*&quot; /S /D"
+    <Exec Command="attrib -R &quot;$(VintagestoryDataDir)\Cache\unpack\$(AssemblyName)*.zip_*&quot; /S /D"
           ContinueOnError="true" StandardOutputImportance="low" StandardErrorImportance="low" />
 
     <!-- Collect the unpack folders by globbing their contents, then strip back to the dir. -->
     <ItemGroup>
-      <StaleUnpackFile Include="$(VintagestoryDataDir)\Cache\unpack\$(AssemblyName).zip_*\**\*" />
+      <StaleUnpackFile Include="$(VintagestoryDataDir)\Cache\unpack\$(AssemblyName)*.zip_*\**\*" />
     </ItemGroup>
 
     <Delete Files="@(StaleUnpackFile)" ContinueOnError="true" />
     <RemoveDir Directories="@(StaleUnpackFile->'%(RootDir)%(Directory)')"
                ContinueOnError="true" />
 
+    <!--
+      Any copy of this mod already in Mods, whatever version it is named after. Two of them there
+      at once is two mods with the same modid and the same assembly name, which is the failure
+      the version in the file name would otherwise start causing on every release.
+    -->
+    <ItemGroup>
+      <InstalledZip Include="$(VintagestoryDataDir)\Mods\$(AssemblyName)*.zip" />
+    </ItemGroup>
+    <Delete Files="@(InstalledZip)" />
+
     <Copy SourceFiles="$(PackageZip)" DestinationFolder="$(VintagestoryDataDir)\Mods" />
 
-    <Message Importance="high" Text="Deployed $(AssemblyName).zip and cleared stale unpack caches." />
+    <Message Importance="high" Text="Deployed $(AssemblyName)_$(ModVersion).zip and cleared stale unpack caches." />
     <Message Importance="high" Text="If Vintage Story is running, restart it." />
   </Target>
 
