@@ -103,6 +103,36 @@ namespace ModMenu
 
         public int ReachBonus;
 
+        /// <summary>Outlines the chosen blocks and creatures through walls.</summary>
+        public bool Esp;
+
+        /// <summary>
+        /// How far ESP looks, in blocks. Work grows with the cube of this, so the sweep runs off
+        /// the render thread and skips whole chunks the client has not loaded - at the top of
+        /// the range almost everything in the box is unloaded and costs nothing to reject. What
+        /// is left is still a lot, so large ranges resweep less often.
+        /// </summary>
+        public const int MinEspRange = 8;
+        public const int MaxEspRange = 500;
+
+        public int EspRange = 24;
+
+        /// <summary>
+        /// Draws nothing but the tracked blocks, so they stand in open air rather than being
+        /// outlined through the rock - the outlines come off while it is on. The world is only
+        /// hidden, not gone: it is still there to stand on and to mine. Does nothing until at
+        /// least one block is being tracked, since hiding everything with nothing left visible
+        /// would just empty the screen. Wants <see cref="Fullbright"/> on with it.
+        /// </summary>
+        public bool TransparentWorld;
+
+        /// <summary>
+        /// What ESP outlines, one entry per thing the player picked - "Native copper ore"
+        /// carrying every host rock variant's code. Codes rather than ids, because ids are
+        /// assigned per world and would point at something else on the next server.
+        /// </summary>
+        public EspGroup[] EspTargets = new EspGroup[0];
+
         public SavedLocation[] Locations =
         {
             new SavedLocation { Name = "Home" },
@@ -147,6 +177,42 @@ namespace ModMenu
 
             if (ReachBonus < MinReachBonus) ReachBonus = MinReachBonus;
             else if (ReachBonus > MaxReachBonus) ReachBonus = MaxReachBonus;
+
+            if (EspRange < MinEspRange) EspRange = MinEspRange;
+            else if (EspRange > MaxEspRange) EspRange = MaxEspRange;
+
+            if (EspTargets == null) EspTargets = new EspGroup[0];
+            else
+            {
+                // A hand-edited file can leave holes, and every one of these is read on a
+                // render frame.
+                EspTargets = System.Array.FindAll(EspTargets,
+                    g => g != null && g.Name != null && g.Codes != null && g.Codes.Length > 0);
+            }
+
+            AssignMissingColors();
+        }
+
+        /// <summary>
+        /// Gives a colour to every target that has none - targets saved before colours existed,
+        /// and anything a hand-edited file left blank. Each takes the first colour no other
+        /// target is using, which is the same rule the menu follows when one is added.
+        /// </summary>
+        public void AssignMissingColors()
+        {
+            var taken = new System.Collections.Generic.HashSet<int>();
+            foreach (EspGroup group in EspTargets)
+            {
+                if (group.Color != 0) taken.Add(group.Color);
+            }
+
+            foreach (EspGroup group in EspTargets)
+            {
+                if (group.Color != 0) continue;
+
+                group.Color = EspPalette.FirstUnused(taken);
+                taken.Add(group.Color);
+            }
         }
     }
 }

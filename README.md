@@ -2,37 +2,49 @@
 
 A client-side utility menu for Vintage Story 1.22. Press **F2** in game to open it.
 
-<img src="docs/screenshot1.png" alt="The Mod Menu window" width="560">
+<img src="docs/screenshot1.png" alt="Player tab" width="560">
 
-Four tabs - Player, Movement, Mining, Teleport - because as one column it outgrew the screen at
-larger GUI scales. A tab that still does not fit splits into a second column rather than running
-off the bottom. Greyed switches are the ones this server cannot honour; hovering says why.
+<img src="docs/screenshot2.png" alt="Movement tab" width="560">
+
+<img src="docs/screenshot3.png" alt="Mining tab" width="560">
+
+<img src="docs/screenshot4.png" alt="ESP tab" width="720">
+
+<img src="docs/screenshot5.png" alt="Teleport tab" width="560">
+
+Five tabs - Player, Movement, Mining, ESP, Teleport - because as one column it outgrew the screen
+at larger GUI scales. A tab that still does not fit splits into a second column rather than
+running off the bottom. Greyed switches are the ones this server cannot honour; hovering says why.
 
 ## Features
 
 - **Invincibility** — blocks all incoming damage
+- **One hit kill** — anything you hit dies
+- **No hunger** — saturation stops draining
+- **Fullbright** — unlit caves become readable at full view distance, no torches involved
+- **Reach** — up to 100 blocks of extra reach for opening, breaking and placing. Attacking that
+  far needs the mod on the server too, and then follows the slider without a switch of its own
 - **Flight** — free movement in any direction, with a speed slider from 1x to 3x in tenths and
   fall protection on landing whether or not *No fall damage* is on
 - **No clip** — move through blocks; works on its own, no need to switch flight on first
-- **Teleport to coordinates** — type X/Y/Z and go
-- **Three saveable locations** — stand somewhere, press *Save*, rename the slot to whatever you like, press *Go* to return
-- **Fullbright** — unlit caves become readable, no torches involved
-- **Reach** — up to 100 blocks of extra reach for opening, breaking and placing. Attacking that
-  far needs the mod on the server too, and then follows the slider without a switch of its own
 - **Instant mine** — blocks break in a single tick
 - **Vein miner** — breaking one block of a vein takes the rest of it, up to a limit you set
-  between 1 and 400 blocks, with white outlines showing what the next swing would take, and a
-  *AntiAbuse Safe* switch deciding whether it trickles or goes all at once
+  between 1 and 400 blocks, with the rest of the vein painted red so you can see what the next
+  swing would take, and an *AntiAbuse Safe* switch deciding whether it trickles or goes all at once
+- **No durability loss** — tools, weapons and armour never wear down
 - **Drops at player** — what you mine lands at your feet instead of in the hole
 - **Faster pickup** — lifts the server's 23-items-a-second collection rate, which is the real
   bottleneck after a large vein mine
-- **One hit kill** — anything you hit dies
-- **No hunger** — saturation stops draining
-- **No durability loss** — tools, weapons and armour never wear down
+- **ESP** — search for any block or creature and have it painted in solid colour through the
+  world, out to 500 blocks. Each target gets its own colour, and *Transparent world* hides
+  everything else so only what you are looking for is drawn
+- **Teleport to coordinates** — type X/Y/Z and go
+- **Three saveable locations** — stand somewhere, press *Save*, rename the slot to whatever you
+  like, press *Go* to return
 - **Teleport from the world map** — right-click anywhere on the map for a small menu with the
   usual waypoint option plus *Teleport here*
 
-Toggles and saved locations persist in `ModConfig/modmenu.json` between sessions.
+Toggles, targets and saved locations persist in `ModConfig/modmenu.json` between sessions.
 
 ## What actually works where
 
@@ -44,11 +56,12 @@ side of that line. This matters if you play on servers you do not control.
 | Flight / no-clip | yes | yes | yes |
 | Teleport (coords and slots) | yes | yes | yes |
 | Fullbright | yes | yes | yes |
+| ESP / transparent world | yes | yes | yes |
 | Reach, on blocks | yes | yes | **only with anti abuse off** |
 | Instant mine | yes | yes | yes |
 | Vein miner | yes | yes | yes |
-| Invincibility (full) | yes | yes | **client-visual only** |
 | No fall damage | yes | yes | **yes** |
+| Invincibility (full) | yes | yes | **client-visual only** |
 | No durability loss | yes | yes | **client-visual only** |
 | Drops at player | yes | yes | **no** |
 | One hit kill | yes | yes | **no** |
@@ -74,23 +87,9 @@ The reasoning:
 - **Mining speed is client-authoritative.** `Block.OnGettingBroken` is documented as
   *"called only client side, every 40ms during breaking"*, and returning a remaining resistance
   of `<= 0` is what triggers the break. So the client genuinely decides when a block gives way.
-- **Fullbright is baked into the chunk mesh, not painted over the screen.** Terrain light in
-  Vintage Story is not a lamp shining at runtime: it is baked into vertex colours when a chunk
-  is tesselated. `ChunkTesselator` builds a `ColorUtil.LightUtil` over the world's light level
-  tables and calls `ToRgba` for every vertex, packing block light into RGB and sun light into
-  A. The mod answers that call with "fully lit", so unlit rock tesselates exactly like rock in
-  daylight. Meshes already built keep the light they were built with, so toggling it calls
-  `ClientMain.RedrawAllBlocks` - the same thing the `/redraw` debug command does.
-
-  Entities, items and anything held are lit by a different route - `GetLightRGBs` reads
-  `SunLightLevels` and `BlockLightLevels` straight off the world - so those tables are
-  flattened to 1.0 as well, and restored from a copy when the toggle goes off. They arrive with
-  the world metadata rather than at startup, which is why it applies on player join.
-
-  The first attempt at this drove the gamma setting instead, and it did not work: an unlit cave
-  renders as black, `pow(0, anything)` is still 0, and no brightness curve turns black into
-  something you can see. All that is left of it is a one-shot restore, in case that version
-  crashed while holding somebody's gamma.
+- **Rendering is entirely the client's.** ESP, transparent world and fullbright never ask the
+  server anything - they change what this client draws and nothing else. Nothing is sent, so
+  there is nothing for a server to accept or refuse.
 - **Reach is client-side to aim and server-side to accept, and the two disagree.** The aim ray
   is built in `PickingRayUtil` to exactly `player.WorldData.PickingRange` blocks, and the
   client's setter for that is a plain field write - nothing is sent, nothing asks permission.
@@ -112,10 +111,6 @@ The reasoning:
   where hitting it does not. The server also only looks for the entity within its own
   `PickingRange + 10`, which is a second ceiling at around 14 blocks.
 
-  The server's copy of your picking range never changes, incidentally: `RequestModeChange` only
-  accepts a new one from a player holding the `pickingrange` privilege, so every check above
-  measures against the stock 4.5.
-
   With the mod on both sides that row does bend, and without a switch of its own - but it takes
   three separate lifts, because the swing is blocked in three places:
 
@@ -128,10 +123,7 @@ The reasoning:
   3. **The server rejects the distance**, the `2 x GetAttackRange` check above.
 
   All three are answered by lifting `GetAttackRange` for the length of one swing, plus the
-  server's picking range for the length of one packet, both put straight back afterwards. A
-  prefix marks who is swinging and the other patches answer while the mark is set - the same
-  two-patch shape *Drops at player* uses, for the same reason: the value is decided somewhere
-  that has no idea which player it is for.
+  server's picking range for the length of one packet, both put straight back afterwards.
 - **Vein miner rides on that same client authority.** Every extra block goes through
   `ClientMain.OnPlayerTryDestroyBlock`, the one door a player-driven break uses, so the server
   sees nothing but an ordinary run of mining. Which is exactly why it is paced - see the
@@ -144,8 +136,7 @@ The reasoning:
   being broken. A vein miner breaks blocks nobody is aiming at, and the moment the ore under
   the crosshair is gone that field is null, which lands as a `NullReferenceException` inside
   the land claim check and takes the client down with it. So the block being broken is swapped
-  into that field for the duration of the call and put back afterwards, which also points the
-  claim check at the block that is actually being broken.
+  into that field for the duration of the call and put back afterwards.
 - **Drops are the server's to hand out.** `Block.SpawnDropsAndRemoveBlock` only spawns
   anything when `world.Side` is Server, so *Drops at player* needs the mod on the server. In
   singleplayer the internal server is in the same process, so it works there.
@@ -156,7 +147,6 @@ The reasoning:
   (`OnEntityReceiveDamage` returns immediately when `entity.World.Side` is Client) and in
   `ServerSystemBlockSimulation`, which re-runs `OnBlockBrokenWith` on the server's own
   inventory copy after every break.
-
 - **Fall damage is the exception**, and *No fall damage* exploits it. A remote server runs no
   real physics for a client-controlled player; it **reconstructs** the landing velocity from
   the position packets the client sends
@@ -165,8 +155,7 @@ The reasoning:
   (`EntityBehaviorHealth.OnFallToGround`), *regardless of how far you fell*. So the mod simply
   eases the descent the server sees in the last blocks before the ground. Because the
   server owns no better information than what the client reports, this works without the mod
-  being installed server-side. It only softens the very end of a fall, so normal movement is
-  untouched.
+  being installed server-side.
 
   How short that ending can be is set by the server's own arithmetic. It builds one speed
   value per position packet, and the client sends one every 4th physics tick (`1/60`s each),
@@ -184,6 +173,94 @@ The reasoning:
 
 In singleplayer everything works because the client and the internal server run in the same
 process, so the Harmony patches cover both halves at once.
+
+## ESP
+
+Type at least two letters into the search box and click a result to start tracking it. Click a
+row in **Active targets** to stop tracking it, or click its colour square to change the colour.
+
+Searching matches display names rather than block codes, because that is what people type, and
+entries are merged by that name - one *Native copper ore* row rather than the twenty block codes
+it covers, one per host rock. Every code behind that name is tracked together and shares a
+colour.
+
+**Colours are handed out, not chosen.** Targets take the first colour nobody else is using from a
+palette of twenty, ordered so that any prefix of it is as distinguishable as possible: pick five
+things and you get yellow, blue, green, magenta and orange. Pick twenty and you reach the end,
+where they are still distinct but no longer obviously so - there is no way to have it both ways.
+Removing a target frees its colour for the next one added. Clicking a colour square steps to the
+next colour in the palette.
+
+**Red is not in the palette.** It belongs to the vein miner's preview, and a colour that means
+"this is about to be mined" must not also mean "this is granite".
+
+Blocks are drawn as solid colour with the faces between two blocks of the same target left out,
+so a vein arrives as one shape rather than a pile of cubes. They are drawn with depth testing
+off, which is what puts them through the rock rather than behind it. Creatures get an outline in
+their target's colour instead.
+
+**Transparent world** stops every block except the tracked ones from being drawn, leaving them
+standing in open air. The world is only hidden, not gone - it is still there to walk on and to
+mine, because collision and aiming read the collision and selection boxes, which are untouched.
+Two things decide whether a face reaches a chunk mesh and both have to be answered: the block's
+own `DrawType`, which is set to `Empty` (what air is), and the *neighbour's* `SideOpaque`, which
+is cleared - a face is culled where the block beyond it is opaque, so hiding stone without also
+clearing its opacity would leave buried ore with all six faces culled. Invisible, inside an
+invisible world.
+
+While transparent world is on the outlines come off, since what is left is the only thing being
+drawn, and fullbright is switched on for as long as it lasts whatever the Player tab says - an
+unlit block in an emptied world is not something you can see.
+
+### What it costs
+
+The range slider runs to 500 blocks, and the work grows with the cube of it, so the scan is
+arranged not to repeat itself:
+
+- chunks are read straight out of their own block array rather than through the block accessor,
+  which turns a delegate call and a chunk lookup per block into an array index. Empty chunks are
+  rejected outright
+- what is found is kept per chunk as a bitmap - one bit per block position, 4KB a chunk - so it
+  survives moving around and changing the range. Only changing what you are looking for throws it
+  away
+- scanning runs on worker threads, one chunk each, nearest first, and every chunk gets its own
+  mesh as soon as it is read, so results appear as they are found rather than after the whole
+  radius has been walked
+
+Keeping it current is the other half. Mining a tracked block clears it on the next frame at the
+cost of one dictionary lookup and one bit test - blocks you were never tracking, which is nearly
+every block anyone breaks, stop there. Whatever went with the break is caught by reading that one
+chunk again shortly after: grass losing its soil, sand starting to fall and leaves decaying are
+all removed by the client without any change of their own being announced, so no number of event
+hooks would find them. Chunks holding nothing tracked are never re-read, and a chunk queues once
+however many blocks changed in it - vein-mining four hundred blocks is one re-read.
+
+### Fullbright, and why it used to stop at twenty blocks
+
+Lifting the light is only half of it. `AmbientManager` keeps a modifier called `blackfogincaves`
+whose weight it drives from the sunlight reaching the player, so underground it goes to full and
+everything past a short distance fades to black. Two more work against it from the same place:
+the `night` modifier drives `SceneBrightness` and `FogBrightness` down as daylight falls, and
+those multiply the blended ambient and fog colours for the whole scene. No amount of brightening
+blocks beats that, because it is applied after them.
+
+So fullbright puts a modifier of its own at the end of the ambient stack with full weight on
+every one of those: no fog of any kind, and scene brightness held at one. Modifiers blend in the
+order they are held, so weight 1 at the end is the last word - and it re-asserts itself, because
+anything registered later (weather, an ambient the server pushes) would blend back over it.
+
+Terrain light itself is baked into the chunk mesh rather than painted over the screen:
+`ChunkTesselator` builds a `ColorUtil.LightUtil` over the world's light level tables and calls
+`ToRgba` for every vertex. The mod answers that call with "fully lit", so unlit rock tesselates
+exactly like rock in daylight, and toggling it calls `ClientMain.RedrawAllBlocks` because meshes
+already built keep the light they were built with. Entities, items and anything held are lit by a
+different route - `GetLightRGBs` reads `SunLightLevels` and `BlockLightLevels` straight off the
+world - so those tables are flattened as well and restored from a copy when the toggle goes off.
+
+**Your view distance is the ceiling.** Removing the fog makes every loaded chunk clear at any
+distance, but nothing can draw a chunk the client does not have, and the default view distance is
+256 blocks. Raise it in the game's graphics settings if you want to see further. Servers also cap
+chunk radius (`MaxChunkRadius`, 12 chunks by default), and that cap wins over your setting.
 
 ## The block break ban, and why vein mining is paced
 
@@ -234,13 +311,9 @@ ban is 14 days by default.
 **Reach is not a separate problem to solve.** Nothing on the client limits how far away a block
 can be: breaks go straight to `OnPlayerTryDestroyBlock` with a position, no aiming involved, so
 the vein miner is already reaching as far as the vein goes. The only reach check anywhere is
-the server's, and it is behind the same `AntiAbuse` switch as the ban - measured from the
-server's copy of your eye position against `PickingRange + 0.7`, roughly 5 blocks, with
-`PickingRange` itself only raisable by a privilege the server grants. So either a server has
+the server's, and it is behind the same `AntiAbuse` switch as the ban. So either a server has
 anti abuse off, and there is no reach limit to get around, or it has it on, and breaking a vein
-all at once is a ban wherever the blocks are. Beating the check would mean feeding the server
-false positions between breaks, which is only worth building for the paced mode - say so if you
-want it.
+all at once is a ban wherever the blocks are.
 
 ## Coordinates
 
@@ -301,19 +374,6 @@ pretending, the mod teleports and tells you `(destination not loaded, clearance 
 Jumping twice to the same place works — the second time the chunk is loaded and the check is
 real.
 
-## Installing
-
-Drop `ModMenu.zip` (or just the built `ModMenu.dll` plus `modinfo.json`) into:
-
-```
-%APPDATA%\VintagestoryData\Mods
-```
-
-The mod is declared `Universal` but with `requiredOnServer: false`, so it installs and runs
-client-side on its own. If you also run your own server, putting the same file in the server's
-`Mods` folder promotes invincibility and durability from cosmetic to real — the client reports
-its toggles over a `modmenu` network channel, and the server applies them per player.
-
 ## Teleporting from the world map
 
 Right-clicking the map normally opens the add/edit waypoint dialog straight away. With this
@@ -336,36 +396,30 @@ These two hooks are the only part of the mod that reaches into `VSEssentials` ra
 core API, so they are applied separately inside a try/catch. If a future game update renames
 them, the map menu is skipped with a warning in the log and everything else still works.
 
+## Installing
+
+Drop `ModMenu.zip` into:
+
+```
+%APPDATA%\VintagestoryData\Mods
+```
+
+The mod is declared `Universal` but with `requiredOnServer: false`, so it installs and runs
+client-side on its own. If you also run your own server, putting the same file in the server's
+`Mods` folder promotes invincibility and durability from cosmetic to real — the client reports
+its toggles over a `modmenu` network channel, and the server applies them per player.
+
 ## Updating the mod
 
 **Close Vintage Story before replacing the zip, then start it again.** That is the whole
 procedure — there is nothing to clean up, and no cache to touch.
 
-If you swap the zip while the game is still running, the next world load fails with:
-
-```
-[Error] [modmenu] Could not load file or assembly 'ModMenu, Version=1.0.0.0'.
-                  Assembly with same name is already loaded
-```
-
-and the mod is skipped entirely — the hotkey never registers, so the menu just does not open.
-
-This is a .NET limitation, not a mod bug: once a process has loaded an assembly it cannot
-load a different one with the same name, so the already-running game is stuck with the old
-copy. The game detects this case and means to tell you *"Please restart the game"*, but the
-check compares against the bare message text while the real exception arrives with a
-`Could not load file or assembly ...` prefix, so the helpful line never prints and you get
-the raw error instead.
-
-Restarting the game is the fix. Bumping the mod version does not help — .NET rejects the
-duplicate name whether the versions match or differ.
-
-### What about the `Cache\unpack\ModMenu.zip_<hash>` folders?
-
-Leave them alone. Each is keyed by a hash of the zip it came from, and `ModContainer` only
-ever enumerates the folder matching the zip currently in `Mods`. Old folders are never
-loaded — they are just a few KB of dead disk space that Vintage Story does not garbage
-collect. Deleting them changes nothing.
+If you swap the zip while the game is still running, the next world load fails with
+`Could not load file or assembly 'ModMenu' ... Assembly with same name is already loaded`, and
+the mod is skipped entirely — the hotkey never registers, so the menu just does not open. This
+is a .NET limitation, not a mod bug: once a process has loaded an assembly it cannot load a
+different one with the same name. Restarting the game is the fix; bumping the mod version does
+not help.
 
 ## Building
 
@@ -376,17 +430,17 @@ variable, falling back to `%APPDATA%\Vintagestory`.
 dotnet build -c Release
 ```
 
-The output lands in `bin/Release/`.
+The output lands in `bin/Release/`, and a ready-to-install `dist/ModMenu.zip` beside it.
 
 ## Notes
 
 - The hotkey is registered through the game's own keybind system, so it can be remapped in
   Settings → Controls if F2 collides with something.
-- While the vein miner is on, aiming at a block outlines every other block the swing would
-  take, in white. They are drawn with `WireframeCube`, the same class the game outlines the
-  aimed-at block with, so they behave like the selection box does and follow its thickness
-  setting. The block under the crosshair is left to the game's own outline.
-- The outlines and the miner run the same search, so what lights up is what breaks.
+- While the vein miner is on, aiming at a block paints every other block the swing would take in
+  solid red, through whatever is in the way - a vein is mostly buried, and outlines of what you
+  cannot see are hard to read. The block under the crosshair is left alone, since the game
+  outlines that one itself and it is the one whose breaking cracks you want to see.
+- The preview and the miner run the same search, so what lights up is what breaks.
 - The vein miner limit counts the block you hit, so 10 means that one plus nine more. A vein
   already draining is left to finish: mining something else meanwhile breaks just that block.
 - Connected means any of the 26 surrounding positions, diagonals included, since veins run

@@ -2,42 +2,44 @@ using System.Collections.Generic;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
-using Vintagestory.Client.NoObf;
 
 namespace ModMenu
 {
     /// <summary>
-    /// Outlines every block a vein mine would take, while the vein miner is on and the player
-    /// is looking at something.
+    /// Paints every block a vein mine would take, while the vein miner is on and the player is
+    /// looking at something.
     ///
-    /// Drawn with WireframeCube, the same class the game outlines the aimed-at block with
-    /// (SystemSelectedBlockOutline), at the same render stage - so the preview sits in the
-    /// world exactly like the selection box does, in white rather than black.
+    /// Drawn the same way ESP draws its targets - solid colour, through whatever is in the way -
+    /// because a vein is mostly buried and outlines of what you cannot see are hard to read. In
+    /// red, which is why no ESP target is ever given red: this colour means "about to be mined"
+    /// and nothing else.
     ///
-    /// The vein itself comes from VeinMiner.FindVein, the same search the miner runs, so the
-    /// outlines cannot promise something the miner would not break.
+    /// The vein itself comes from VeinMiner.FindVein, the same search the miner runs, so what is
+    /// painted cannot promise something the miner would not break.
     /// </summary>
     public class VeinPreview : IRenderer
     {
-        /// <summary>Slightly see-through, so a vein several blocks deep stays readable.</summary>
-        private static readonly Vec4f Colour = new Vec4f(1f, 1f, 1f, 0.85f);
-
         private readonly ICoreClientAPI capi;
         private readonly ModMenuConfig config;
 
-        /// <summary>Built on the first frame: uploading a mesh needs the render thread.</summary>
-        private WireframeCube cube;
+        /// <summary>The vein as one shape, rebuilt whenever the vein itself changes.</summary>
+        private MeshRef mesh;
 
         private List<BlockPos> vein = new List<BlockPos>();
+
+        /// <summary>Where the mesh was built around, since it is drawn relative to that.</summary>
+        private BlockPos meshOrigin;
 
         // What the cached vein was worked out from, to not re-walk it every frame.
         private BlockPos fromPos;
         private int fromBlockId;
         private int fromLimit;
 
+        private readonly Matrixf modelViewMatrix = new Matrixf();
+
         public double RenderOrder => 0.9;
 
-        /// <summary>Blocks away the outlines stay visible. Past a vein's own size is pointless.</summary>
+        /// <summary>Blocks away the preview stays visible. Past a vein's own size is pointless.</summary>
         public int RenderRange => 24;
 
         public VeinPreview(ICoreClientAPI capi, ModMenuConfig config)
@@ -65,25 +67,47 @@ namespace ModMenu
 
             Refresh(aimed.Position, block.Id);
 
-            // Only the extra blocks are worth outlining: the first is the one already under the
-            // crosshair, which the game is outlining itself.
-            if (vein.Count < 2) return;
-
-            if (cube == null) cube = WireframeCube.CreateUnitCube(capi);
+            if (mesh == null || mesh.Disposed) return;
 
             EntityPlayer player = capi.World.Player.Entity;
-            Vec3d offset = player.CameraPosOffset;
+            Vec3d camera = player.CameraPos;
 
-            for (int i = 1; i < vein.Count; i++)
+            IRenderAPI render = capi.Render;
+
+            // Seeing the buried part is the whole point, so the depth buffer is ignored here -
+            // and with it depth writing and face culling, exactly as ESP does.
+            render.GlToggleBlend(true);
+            render.GLDepthMask(false);
+            render.GLDisableDepthTest();
+            render.GlDisableCullFace();
+
+            try
             {
-                BlockPos pos = vein[i];
-                cube.Render(capi,
-                    pos.X + offset.X,
-                    pos.InternalY + offset.Y,
-                    pos.Z + offset.Z,
-                    1f, 1f, 1f,
-                    1.6f * ClientSettings.Wireframethickness,
-                    Colour);
+                IShaderProgram shader = render.GetEngineShader(EnumShaderProgram.Wireframe);
+                shader.Use();
+
+                shader.Uniform("origin", Vec3f.Zero);
+                shader.Uniform("colorIn", ColorUtil.WhiteArgbVec);
+                shader.UniformMatrix("projectionMatrix", render.CurrentProjectionMatrix);
+
+                modelViewMatrix
+                    .Identity()
+                    .Set(render.CameraMatrixOrigin)
+                    .Translate(
+                        meshOrigin.X - camera.X,
+                        meshOrigin.InternalY - camera.Y,
+                        meshOrigin.Z - camera.Z);
+
+                shader.UniformMatrix("modelViewMatrix", modelViewMatrix.Values);
+                render.RenderMesh(mesh);
+
+                shader.Stop();
+            }
+            finally
+            {
+                render.GlEnableCullFace();
+                render.GLEnableDepthTest();
+                render.GLDepthMask(true);
             }
         }
 
@@ -101,6 +125,53 @@ namespace ModMenu
             fromLimit = config.VeinMinerLimit;
 
             vein = VeinMiner.FindVein(capi.World.BlockAccessor, fromPos, blockId, fromLimit);
+
+            Build();
+        }
+
+        /// <summary>
+        /// Builds the vein as one mesh, with the faces between two of its own blocks left out -
+        /// so it arrives as a single shape rather than a pile of cubes, the same as ESP.
+        ///
+        /// The block under the crosshair is not painted. The game outlines that one itself, and
+        /// it is the one whose breaking cracks you want to see. Faces onto it are left out all
+        /// the same: with no depth testing, what shows through that opening is the inside of the
+        /// same red mass, so drawing them would only add triangles.
+        /// </summary>
+        private void Build()
+        {
+            Release();
+
+            if (vein.Count < 2) return;
+
+            meshOrigin = vein[0].Copy();
+
+            var inVein = new HashSet<BlockPos>(vein);
+            var data = new MeshData(24, 36, false, false, true, true);
+            var size = new Vec3f(1, 1, 1);
+            var neighbour = new BlockPos(meshOrigin.dimension);
+
+            for (int i = 1; i < vein.Count; i++)
+            {
+                BlockPos pos = vein[i];
+
+                var centre = new Vec3f(
+                    pos.X - meshOrigin.X + 0.5f,
+                    pos.Y - meshOrigin.Y + 0.5f,
+                    pos.Z - meshOrigin.Z + 0.5f);
+
+                foreach (BlockFacing face in BlockFacing.ALLFACES)
+                {
+                    neighbour.Set(pos.X + face.Normali.X, pos.Y + face.Normali.Y, pos.Z + face.Normali.Z);
+
+                    if (inVein.Contains(neighbour)) continue;
+
+                    ModelCubeUtilExt.AddFaceSkipTex(data, face, centre, size, EspPalette.VeinRed);
+                }
+            }
+
+            if (data.VerticesCount > 0) mesh = capi.Render.UploadMesh(data);
+            data.Dispose();
         }
 
         private void Forget()
@@ -109,12 +180,21 @@ namespace ModMenu
 
             fromPos = null;
             vein.Clear();
+
+            Release();
+        }
+
+        private void Release()
+        {
+            if (mesh == null) return;
+
+            capi.Render.DeleteMesh(mesh);
+            mesh = null;
         }
 
         public void Dispose()
         {
-            cube?.Dispose();
-            cube = null;
+            Release();
         }
     }
 }

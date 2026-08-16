@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using HarmonyLib;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
@@ -38,6 +39,7 @@ namespace ModMenu
         private MapContextMenu mapMenu;
         private VeinMiner veinMiner;
         private VeinPreview veinPreview;
+        private EspRenderer espRenderer;
 
         public ModMenuConfig Config { get; private set; }
 
@@ -106,6 +108,18 @@ namespace ModMenu
             veinPreview = new VeinPreview(api, Config);
             api.Event.RegisterRenderer(veinPreview, EnumRenderStage.AfterFinalComposition, "modmenu-vein");
 
+            espRenderer = new EspRenderer(api, Config);
+            api.Event.RegisterRenderer(espRenderer, EnumRenderStage.AfterFinalComposition, "modmenu-esp");
+
+            // Prepared here rather than when the ESP tab opens: it walks every block type and
+            // resolves a name for each, which is a visible freeze if it happens on the frame a
+            // GUI is composing.
+            api.Event.LevelFinalize += () =>
+            {
+                EspCatalogue.Build(api);
+                Mod.Logger.Notification("ESP catalogue ready: {0} entries", EspCatalogue.Count);
+            };
+
             // The local player does not exist yet at StartClientSide, so push the saved
             // toggles into the shared state once the world is actually running.
             api.Event.PlayerJoin += OnLocalPlayerJoin;
@@ -160,7 +174,53 @@ namespace ModMenu
             ApplyRangedAttack();
 
             // Only now do the world's light tables exist to be flattened.
-            if (Config.Fullbright) ApplyFullbright(true);
+            SyncFullbright();
+        }
+
+        // ---- esp targets -----------------------------------------------------------
+
+        /// <summary>
+        /// Everything ESP can be pointed at. Prepared once the world has loaded, because
+        /// building it walks every block type and asks the language files for a name.
+        /// </summary>
+        public EspCatalogue EspCatalogue { get; } = new EspCatalogue();
+
+        public bool IsEspTarget(string name)
+            => Array.Exists(Config.EspTargets, g => g?.Name == name);
+
+        public void AddEspTarget(EspGroup group)
+        {
+            if (group?.Name == null || IsEspTarget(group.Name)) return;
+
+            // The first colour nobody else is on, so five targets get the five that are hardest
+            // to confuse with one another rather than five arbitrary ones.
+            var taken = new HashSet<int>();
+            foreach (EspGroup existing in Config.EspTargets) taken.Add(existing.Color);
+
+            group.Color = EspPalette.FirstUnused(taken);
+
+            var grown = new EspGroup[Config.EspTargets.Length + 1];
+            Config.EspTargets.CopyTo(grown, 0);
+            grown[grown.Length - 1] = group;
+
+            Config.EspTargets = grown;
+            SaveConfig();
+        }
+
+        /// <summary>Steps one target on to the next colour in the palette.</summary>
+        public void CycleEspTargetColor(string name)
+        {
+            EspGroup group = Array.Find(Config.EspTargets, g => g?.Name == name);
+            if (group == null) return;
+
+            group.Color = EspPalette.After(group.Color);
+            SaveConfig();
+        }
+
+        public void RemoveEspTarget(string name)
+        {
+            Config.EspTargets = Array.FindAll(Config.EspTargets, g => g?.Name != name);
+            SaveConfig();
         }
 
         /// <summary>Records a feature locally, and tells the server only when it is on.</summary>
@@ -233,11 +293,30 @@ namespace ModMenu
         private float[] savedBlockLightLevels;
         private float[] savedSunLightLevels;
 
+        /// <summary>Fullbright as it stands applied, which is not always what the switch says.</summary>
+        private bool fullbrightApplied;
+
+        /// <summary>
+        /// Turns fullbright on and off from what is actually wanted rather than from the switch
+        /// alone, because hiding the world wants it too and does not care what the switch says.
+        /// Applying it is not free - the light tables are rewritten and every chunk mesh is
+        /// rebuilt - so it only runs on a change.
+        /// </summary>
+        public void SyncFullbright()
+        {
+            bool wanted = Config.Fullbright || (espRenderer?.HidingWorld ?? false);
+            if (wanted == fullbrightApplied) return;
+
+            fullbrightApplied = wanted;
+            ApplyFullbright(wanted);
+        }
+
         public void ApplyFullbright(bool enabled)
         {
             Patches.FullbrightPatch.Enabled = enabled;
 
             ApplyFullbrightEntityLight(enabled);
+            ApplyFullbrightAmbient(enabled);
 
             // Light is baked into the chunk meshes, so nothing on screen changes until they are
             // rebuilt. Null before a world is up, where there is nothing to redraw anyway.
@@ -275,6 +354,75 @@ namespace ModMenu
 
             savedBlockLightLevels = null;
             savedSunLightLevels = null;
+        }
+
+        /// <summary>Our entry in the ambient stack. Namespaced so it cannot collide.</summary>
+        private const string FullbrightAmbientKey = "modmenu:fullbright";
+
+        /// <summary>
+        /// Lifting the light on its own only carries about twenty blocks, and the reason is not
+        /// the light at all - it is what the game paints over the distance.
+        ///
+        /// AmbientManager keeps a modifier called "blackfogincaves" whose weight it drives from
+        /// the sunlight reaching the player, so underground it goes to full and everything past
+        /// a short distance fades to black. Two more work against it from the same place: the
+        /// "night" modifier drives SceneBrightness and FogBrightness down as daylight falls, and
+        /// those multiply the blended ambient and fog colours for the whole scene.
+        ///
+        /// So this puts a modifier of our own at the end of the stack with full weight on every
+        /// one of those: no fog of any kind, and scene brightness held at one. Modifiers blend
+        /// in the order they are held - each one lerps the running value toward its own by its
+        /// weight - so weight 1 at the end is the last word.
+        ///
+        /// Fog colour is left alone deliberately. With no fog to draw it only tints the
+        /// background, and a dark background behind fully lit blocks is what makes them read.
+        /// </summary>
+        private void ApplyFullbrightAmbient(bool enabled)
+        {
+            IAmbientManager ambient = capi?.Ambient;
+            if (ambient == null) return;
+
+            // Removed either way: putting it back is what appends it at the end again, since
+            // assigning an existing key would leave it where it was.
+            ambient.CurrentModifiers.Remove(FullbrightAmbientKey);
+            if (!enabled) return;
+
+            ambient.CurrentModifiers[FullbrightAmbientKey] = FullbrightAmbient();
+        }
+
+        /// <summary>
+        /// Full weight on everything that darkens the distance, and left at weight zero - which
+        /// is what EnsurePopulated fills in - on everything else, so nothing else is disturbed.
+        /// </summary>
+        internal static AmbientModifier FullbrightAmbient()
+        {
+            return new AmbientModifier
+            {
+                FogDensity = WeightedFloat.New(0f, 1f),
+                FlatFogDensity = WeightedFloat.New(0f, 1f),
+                FogMin = WeightedFloat.New(0f, 1f),
+                AmbientColor = WeightedFloatArray.New(new[] { 1f, 1f, 1f }, 1f),
+                SceneBrightness = WeightedFloat.New(1f, 1f),
+                FogBrightness = WeightedFloat.New(1f, 1f)
+            }.EnsurePopulated();
+        }
+
+        /// <summary>
+        /// Keeps ours the last modifier in the stack. Anything registered after it - weather,
+        /// an ambient the server sends - would otherwise blend back over what it just set, the
+        /// same way the picking range has to be re-asserted after the server pushes its own.
+        /// Costs an index lookup a tick and does nothing the rest of the time.
+        /// </summary>
+        private void KeepFullbrightAmbientLast()
+        {
+            if (!fullbrightApplied) return;
+
+            var modifiers = capi.Ambient?.CurrentModifiers;
+            if (modifiers == null) return;
+
+            if (modifiers.IndexOfKey(FullbrightAmbientKey) == modifiers.Count - 1) return;
+
+            ApplyFullbrightAmbient(true);
         }
 
         /// <summary>
@@ -381,6 +529,11 @@ namespace ModMenu
 
             EntityControls controls = player.Entity.Controls;
             if (controls == null) return;
+
+            // Both here rather than at the switches, because hiding the world turns fullbright
+            // on without anyone pressing anything.
+            SyncFullbright();
+            KeepFullbrightAmbientLast();
 
             // A teleport in progress owns the position and the no-clip flag until it lands.
             if (glideActive)
@@ -870,6 +1023,13 @@ namespace ModMenu
                 capi?.Event.UnregisterRenderer(veinPreview, EnumRenderStage.AfterFinalComposition);
                 veinPreview.Dispose();
                 veinPreview = null;
+            }
+
+            if (espRenderer != null)
+            {
+                capi?.Event.UnregisterRenderer(espRenderer, EnumRenderStage.AfterFinalComposition);
+                espRenderer.Dispose();
+                espRenderer = null;
             }
 
             // Static, so it would otherwise keep the old world's client API alive across a

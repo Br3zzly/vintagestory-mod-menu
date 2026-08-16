@@ -30,7 +30,32 @@ namespace ModMenu
         /// <summary>More than this and the window gets wider than it is tall, which reads worse.</summary>
         private const int MaxColumnCount = 3;
 
-        private static readonly string[] TabNames = { "Player", "Movement", "Mining", "Teleport" };
+        private static readonly string[] TabNames = { "Player", "Movement", "Mining", "ESP", "Teleport" };
+
+        /// <summary>
+        /// Geometry of the two side-by-side lists on the ESP tab. Wide enough for the colour
+        /// square on the right of an active target without the name losing room for it - the
+        /// dialog sizes itself to its contents, so this widens the window rather than the rows.
+        /// </summary>
+        private const double EspListWidth = 310;
+        private const double EspListHeight = 300;
+        private const double EspScrollbarWidth = 20;
+        private const double EspListGap = 24;
+
+        /// <summary>
+        /// Matches shown at once. Not a search limit - the matching itself is a walk over
+        /// precomputed strings and costs nothing. This is a drawing limit: every row is a text
+        /// texture composed through Cairo when the list is filled, and a couple of hundred of
+        /// those is what made typing stutter. Anything past this is narrowed by another word.
+        /// </summary>
+        private const int EspMaxResults = 50;
+
+        /// <summary>
+        /// How long to wait after the last keystroke before refilling the list. Typing
+        /// "copper" is six keystrokes; without this it is six full refills, five of them
+        /// thrown away before anyone reads them.
+        /// </summary>
+        private const int EspSearchDebounceMs = 180;
 
         /// <summary>Shown on the toggles the server decides, when the server has no idea we exist.</summary>
         private const string ServerOnlyHint = "Only works when the mod is installed on the server";
@@ -77,6 +102,21 @@ namespace ModMenu
         /// <summary>Same story again, for the reach bonus.</summary>
         private bool reachUnsaved;
 
+        /// <summary>And again, for the ESP range.</summary>
+        private bool espRangeUnsaved;
+
+        /// <summary>Current text in the ESP search box.</summary>
+        private string espSearch = "";
+
+        /// <summary>Pending refill from the search box, cancelled by the next keystroke.</summary>
+        private long espSearchDebounceId;
+
+        /// <summary>
+        /// Bounds of the two lists and their clipped windows, kept because scrolling and
+        /// refilling both need to recalculate them and hand the scrollbar new heights.
+        /// </summary>
+        private ElementBounds espResultsClip, espActiveClip;
+
         public ModMenuDialog(ICoreClientAPI capi, ModMenuSystem system) : base(capi)
         {
             this.system = system;
@@ -105,12 +145,20 @@ namespace ModMenu
         {
             base.OnGuiClosed();
 
-            if (flySpeedUnsaved || veinLimitUnsaved || reachUnsaved)
+            // Otherwise it fires into a composer that is no longer on screen.
+            if (espSearchDebounceId != 0)
+            {
+                capi.Event.UnregisterCallback(espSearchDebounceId);
+                espSearchDebounceId = 0;
+            }
+
+            if (flySpeedUnsaved || veinLimitUnsaved || reachUnsaved || espRangeUnsaved)
             {
                 system.SaveConfig();
                 flySpeedUnsaved = false;
                 veinLimitUnsaved = false;
                 reachUnsaved = false;
+                espRangeUnsaved = false;
             }
         }
 
@@ -243,6 +291,7 @@ namespace ModMenu
                 case 0: return PlayerRows(font);
                 case 1: return MovementRows(font);
                 case 2: return MiningRows(font);
+                case 3: return EspRows(font);
                 default: return TeleportRows(font);
             }
         }
@@ -371,10 +420,12 @@ namespace ModMenu
                     system.SaveConfig();
                 }, needsServerMod: true),
 
+                // Switched off here, fullbright still stays on while the ESP tab is hiding the
+                // world - that needs it, and says so regardless of what this switch reads.
                 ToggleRow(font, "Fullbright", "swFullbright", on =>
                 {
                     Config.Fullbright = on;
-                    system.ApplyFullbright(on);
+                    system.SyncFullbright();
                     system.SaveConfig();
                 }),
 
@@ -395,6 +446,317 @@ namespace ModMenu
                 })
             };
         }
+
+        /// <summary>
+        /// The ESP tab: a switch, a range slider, a search box, and two scrollable lists -
+        /// matches on the left, what is being outlined on the right.
+        ///
+        /// The rows are shaped after the survival handbook's list - a picture and a name, lit up
+        /// under the pointer - which is what GuiElementEspList draws.
+        ///
+        /// Three details in the plumbing are load bearing and were each wrong in an earlier
+        /// attempt: ForkContainingChild makes a child bounds inside the inset (ForkBoundingParent
+        /// makes a parent and rewrites the receiver, which recurses until the stack dies); the
+        /// scrollbar has to be told both heights afterwards or it does not scroll; and typing
+        /// refills the existing list in place rather than rebuilding the dialog, which is what
+        /// kept stealing focus from the search box after every letter.
+        /// </summary>
+        private List<Row> EspRows(CairoFont font)
+        {
+            return new List<Row>
+            {
+                ToggleRow(font, "Enable ESP", "swEsp", on =>
+                {
+                    Config.Esp = on;
+                    system.SaveConfig();
+                }),
+
+                SliderRow(font, "ESP range", "sldEspRange", v =>
+                {
+                    Config.EspRange = v;
+                    espRangeUnsaved = true;
+                    return true;
+                }),
+
+                // Takes effect on the next frame: the renderer reads it while deciding what to
+                // draw, so nothing needs to be pushed anywhere from here.
+                ToggleRow(font, "Transparent world", "swTransparentWorld", on =>
+                {
+                    Config.TransparentWorld = on;
+                    system.SaveConfig();
+                }),
+
+                new Row(RowHeight + RowGap, delegate (GuiComposer c, double x, ref double y)
+                {
+                    c.AddTextInput(ElementBounds.Fixed(x, y, EspListWidth, RowHeight),
+                        OnEspSearchChanged, font, "tfEspSearch");
+
+                    c.AddStaticText("Active targets", font.Clone().WithWeight(Cairo.FontWeight.Bold),
+                        ElementBounds.Fixed(x + EspListWidth + EspScrollbarWidth + EspListGap, y,
+                            EspListWidth, RowHeight),
+                        null);
+
+                    y += RowHeight + RowGap;
+                }),
+
+                new Row(EspListHeight + RowGap, delegate (GuiComposer c, double x, ref double y)
+                {
+                    ElementBounds resultsInset = ElementBounds.Fixed(x, y, EspListWidth, EspListHeight);
+                    ElementBounds activeInset = ElementBounds.Fixed(
+                        x + EspListWidth + EspScrollbarWidth + EspListGap, y, EspListWidth, EspListHeight);
+
+                    AddEspList(c, resultsInset, "espResults", SearchCells(), out espResultsClip);
+                    AddEspList(c, activeInset, "espActive", ActiveCells(), out espActiveClip);
+
+                    y += EspListHeight + RowGap;
+                })
+            };
+        }
+
+        /// <summary>An inset frame, a scrollbar beside it, and a clipped list of rows inside.</summary>
+        private void AddEspList(GuiComposer composer, ElementBounds inset, string key,
+            List<EspListRow> rows, out ElementBounds clip)
+        {
+            ElementBounds clipBounds = inset.ForkContainingChild(3, 3, 3, 3);
+            ElementBounds listBounds = clipBounds.ForkContainingChild(0, 0, 0, -3).WithFixedPadding(5);
+
+            composer
+                .AddInset(inset)
+                .AddVerticalScrollbar(value => OnEspScroll(key, value),
+                    ElementStdBounds.VerticalScrollbar(inset), key + "Scroll")
+                .BeginClip(clipBounds)
+                .AddEspList(listBounds,
+                    (index, onSwatch) => OnEspRowClicked(key, index, onSwatch),
+                    index => OnEspRowHovered(key, index),
+                    rows, key)
+                .EndClip()
+
+                // Outside the clip, or the tooltip would be cut off at the list's own edge. Its
+                // bounds are a copy of the inset's rather than the inset's own, since the two
+                // elements move them independently while drawing.
+                .AddHoverText("", CairoFont.WhiteSmallText(), (int)EspListWidth,
+                    inset.FlatCopy(), key + "Hover");
+
+            clip = clipBounds;
+        }
+
+        /// <summary>
+        /// Runs a row's action. Rows are handed out by index rather than by reference because
+        /// that is what the list reports, and it is read back here rather than captured so a
+        /// refilled list cannot run the action of a row that is no longer there.
+        /// </summary>
+        private void OnEspRowClicked(string key, int index, bool onSwatch)
+        {
+            GuiElementEspList element = SingleComposer?.GetEspList(key);
+            if (element == null || index < 0 || index >= element.Rows.Count) return;
+
+            EspListRow row = element.Rows[index];
+
+            if (onSwatch) row.OnSwatchClick?.Invoke();
+            else row.OnClick?.Invoke();
+        }
+
+        /// <summary>
+        /// Offers the whole name of the row the pointer has settled on, but only when the row is
+        /// showing a shortened one - a tooltip repeating a name already fully readable is just
+        /// something in the way. An empty text is how the hover element stays hidden.
+        /// </summary>
+        private void OnEspRowHovered(string key, int index)
+        {
+            GuiElementHoverText hover = SingleComposer?.GetHoverText(key + "Hover");
+            if (hover == null) return;
+
+            GuiElementEspList element = SingleComposer.GetEspList(key);
+            bool inRange = element != null && index >= 0 && index < element.Rows.Count;
+
+            EspListRow row = inRange ? element.Rows[index] : null;
+
+            hover.SetNewText(row != null && row.Trimmed ? row.Name : "");
+        }
+
+        private void SizeEspList(string key, ElementBounds clip)
+        {
+            GuiElementEspList element = SingleComposer?.GetEspList(key);
+            if (element == null || clip == null) return;
+
+            SingleComposer.GetScrollbar(key + "Scroll")
+                ?.SetHeights((float)clip.fixedHeight, (float)element.insideBounds.fixedHeight);
+
+            // A tooltip belongs beside the pointer rather than at the corner of the list, which
+            // is where it would sit otherwise.
+            SingleComposer.GetHoverText(key + "Hover")?.SetFollowMouse(true);
+        }
+
+        /// <summary>
+        /// Scrolling moves the surface the rows are drawn on, not the element - the element is
+        /// the window they are seen through. The three pixels match the inset's own edge.
+        /// </summary>
+        private void OnEspScroll(string key, float value)
+        {
+            GuiElementEspList element = SingleComposer?.GetEspList(key);
+            if (element == null) return;
+
+            element.insideBounds.fixedY = 3 - value;
+            element.insideBounds.CalcWorldBounds();
+        }
+
+        /// <summary>
+        /// Refills a list in place. Rebuilding the dialog instead is what made the search box
+        /// lose focus after each letter, since the element being typed into was destroyed.
+        /// </summary>
+        private void RefillEspList(string key, List<EspListRow> rows, ElementBounds clip)
+        {
+            GuiElementEspList element = SingleComposer?.GetEspList(key);
+            if (element == null || clip == null) return;
+
+            element.Reload(rows);
+
+            // The list just changed height, so the scrollbar needs to hear about it.
+            SingleComposer.GetScrollbar(key + "Scroll")
+                ?.SetHeights((float)clip.fixedHeight, (float)element.insideBounds.fixedHeight);
+        }
+
+        /// <summary>
+        /// Typing only schedules the refill. Every keystroke cancels the one before it, so a
+        /// burst of them costs a single refill once the typing pauses.
+        /// </summary>
+        private void OnEspSearchChanged(string text)
+        {
+            if (text == espSearch) return;
+
+            espSearch = text;
+
+            if (espSearchDebounceId != 0) capi.Event.UnregisterCallback(espSearchDebounceId);
+
+            espSearchDebounceId = capi.Event.RegisterCallback(_ =>
+            {
+                espSearchDebounceId = 0;
+                RefillEspList("espResults", SearchCells(), espResultsClip);
+            }, EspSearchDebounceMs);
+        }
+
+        /// <summary>
+        /// Both lists change when a target is added or removed, so both are refilled - but not
+        /// straight away. This is called from a cell's click handler, which runs while the cell
+        /// list is walking its own cells; refilling there pulls the collection out from under
+        /// that loop and throws. Queueing it means the click finishes first.
+        /// </summary>
+        private void RefreshEspLists()
+        {
+            capi.Event.EnqueueMainThreadTask(() =>
+            {
+                RefillEspList("espResults", SearchCells(), espResultsClip);
+                RefillEspList("espActive", ActiveCells(), espActiveClip);
+            }, "modmenu-esp-refresh");
+        }
+
+        private List<EspListRow> SearchCells()
+        {
+            var cells = new List<EspListRow>();
+            EspCatalogue catalogue = system.EspCatalogue;
+
+            if (!catalogue.Ready)
+            {
+                cells.Add(new EspListRow { Name = "Still preparing the block list..." });
+                return cells;
+            }
+
+            string query = espSearch?.Trim() ?? "";
+            if (query.Length < EspCatalogue.MinSearchLength)
+            {
+                cells.Add(new EspListRow
+                {
+                    Name = "Type at least " + EspCatalogue.MinSearchLength + " letters"
+                });
+                return cells;
+            }
+
+            // Anything already being outlined is left out of the results rather than marked as
+            // added: it is one hash lookup per candidate, and a row you cannot usefully click
+            // is just noise in a list you are scanning.
+            var active = new HashSet<string>();
+            foreach (EspGroup group in Config.EspTargets)
+            {
+                if (group?.Name != null) active.Add(group.Name);
+            }
+
+            foreach (EspGroup group in catalogue.Search(query, EspMaxResults, active))
+            {
+                EspGroup picked = group;
+
+                cells.Add(RowFor(picked, () =>
+                {
+                    system.AddEspTarget(picked);
+                    RefreshEspLists();
+                }));
+            }
+
+            if (cells.Count == 0) cells.Add(new EspListRow { Name = "No matches" });
+
+            return cells;
+        }
+
+        private List<EspListRow> ActiveCells()
+        {
+            var cells = new List<EspListRow>();
+
+            foreach (EspGroup group in Config.EspTargets)
+            {
+                EspGroup stored = group;
+
+                EspListRow row = RowFor(stored, () =>
+                {
+                    system.RemoveEspTarget(stored.Name);
+                    RefreshEspLists();
+                });
+
+                // Only the active side carries a colour, and clicking it steps to the next one
+                // rather than removing the target the way the rest of the row does.
+                row.Swatch = stored.Color;
+                row.OnSwatchClick = () =>
+                {
+                    system.CycleEspTargetColor(stored.Name);
+                    RefreshEspLists();
+                };
+
+                cells.Add(row);
+            }
+
+            return cells;
+        }
+
+        private EspListRow RowFor(EspGroup group, Action onClick)
+        {
+            return new EspListRow
+            {
+                Name = group.Name,
+                Icon = IconFor(group),
+                OnClick = onClick
+            };
+        }
+
+        /// <summary>
+        /// What to draw beside the name. A block is a stack of itself; a creature borrows the
+        /// "creature-" item the game keeps for spawning it, which is how the survival handbook
+        /// comes to show a gazelle rather than a blank square. Null when neither exists, and the
+        /// row simply has no picture.
+        /// </summary>
+        private ItemStack IconFor(EspGroup group)
+        {
+            if (group?.Codes == null || group.Codes.Length == 0) return null;
+
+            var code = new AssetLocation(group.Codes[0]);
+
+            if (group.IsBlock)
+            {
+                Block block = capi.World.GetBlock(code);
+                return block == null || block.Id == 0 ? null : new ItemStack(block);
+            }
+
+            Item item = capi.World.GetItem(new AssetLocation(code.Domain, "creature-" + code.Path));
+            return item == null ? null : new ItemStack(item);
+        }
+
 
         private List<Row> TeleportRows(CairoFont font)
         {
@@ -548,6 +910,20 @@ namespace ModMenu
             SetSwitch("swOneHitKill", Config.OneHitKill);
             SetSwitch("swNoHunger", Config.NoHunger);
             SetSwitch("swFastPickup", Config.FastPickup);
+            SetSwitch("swEsp", Config.Esp);
+            SetSwitch("swTransparentWorld", Config.TransparentWorld);
+
+            SetSlider("sldEspRange", Config.EspRange,
+                ModMenuConfig.MinEspRange, ModMenuConfig.MaxEspRange,
+                v => v + " blocks");
+
+            GuiElementTextInput search = SingleComposer.GetTextInput("tfEspSearch");
+            if (search != null) search.SetValue(espSearch);
+
+            // A cell list only knows how tall it is once its bounds have been worked out, and
+            // the scrollbar only knows how far it may travel once told both heights.
+            SizeEspList("espResults", espResultsClip);
+            SizeEspList("espActive", espActiveClip);
 
             // The tooltip has to be in place before SetValues, which is what bakes the value
             // label into a texture. Leaving ShowTextWhenResting off keeps the value out of the
